@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: trade_helper_timescaledb
+    environment:
+      - POSTGRES_USER=trade_admin
+      - POSTGRES_PASSWORD=trade_secure_pass123
+      - POSTGRES_DB=trade_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade_admin -d trade_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: trade_helper_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  timescaledb_data:   
+  redis_data:
