@@ -22,7 +22,9 @@ async def seed_historical_candles():
     
     end_date = datetime.now()
     start_date = end_date - timedelta(days=365 * 2)
-    date_range = pd.date_range(start=start_date, end=end_date, freq='B')
+    
+    # Исправлено: Добавлен параметр tz='UTC' для генерации дат с часовым поясом
+    date_range = pd.date_range(start=start_date, end=end_date, freq='B', tz='UTC')
     
     records = []
     
@@ -38,8 +40,9 @@ async def seed_historical_candles():
             low_p = min(open_p, close_p) * (1 - abs(np.random.normal(0, 0.003)))
             volume = int(np.random.normal(50000, 15000))
             
+            # current_time.to_pydatetime() переводит Timestamp в чистый datetime объект Python
             records.append((
-                current_time,
+                current_time.to_pydatetime(),
                 ticker,
                 round(open_p, 4),
                 round(close_p, 4),

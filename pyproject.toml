@@ -15,8 +15,7 @@ numpy = "^1.26.4"
 scipy = "^1.13.0"
 pandas = "^2.2.0"
 prophet = "^1.1.5"
-
-# Указываем Poetry искать этот пакет в репозитории Т-Банка
+celery = "^5.4.0"
 t-tech-investments = { version = "^1.49.2", source = "tbank" }
 
 [[tool.poetry.source]]
