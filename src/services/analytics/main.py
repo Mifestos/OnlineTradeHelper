@@ -1,11 +1,24 @@
 # src/services/analytics/main.py
 import os
 import sys
+import json
+# Исправлено: Импортируем асинхронный Редис по официальному стандарту redis-py 5.x
+from redis import asyncio as aioredis
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware  # Добавлен импорт CORS
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 from celery.result import AsyncResult
+
+app = FastAPI(title="OnlineTradeHelper AI Analytics Core")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if BASE_DIR not in sys.path:
@@ -13,17 +26,9 @@ if BASE_DIR not in sys.path:
 
 from src.database.connection import db_manager
 from src.services.analytics.worker import celery_app
+from src.settings import REDIS_HOST, REDIS_PORT
 
-app = FastAPI(title="OnlineTradeHelper AI Analytics Core")
-
-# НАСТРОЙКА CORS: Разрешаем браузеру принимать ответы от бэкенда
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Разрешаем запросы с любых локальных файлов
-    allow_credentials=True,
-    allow_methods=["*"],  # Разрешаем любые методы (GET, POST)
-    allow_headers=["*"],  # Разрешаем любые заголовки
-)
+current_global_subscriptions = {"SBER", "YDEX", "LKOH"}
 
 class OptimizationRequest(BaseModel):
     selected_tickers: List[str]
@@ -44,9 +49,32 @@ async def shutdown_event():
 
 @app.post("/api/v1/optimize")
 async def optimize_portfolio_endpoint(request: OptimizationRequest):
+    global current_global_subscriptions
     if not request.selected_tickers:
         raise HTTPException(status_code=400, detail="Список тикеров не может быть пустым")
     
+    try:
+        redis_client = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        request_tickers_set = set(request.selected_tickers)
+        
+        for ticker in request_tickers_set:
+            if ticker not in current_global_subscriptions:
+                command = {"action": "subscribe", "ticker": ticker}
+                await redis_client.publish("ticker_subscriptions", json.dumps(command))
+                current_global_subscriptions.add(ticker)
+                print(f"[FASTAPI] Отправлена команда в Redis на подписку: {ticker}")
+                
+        for ticker in list(current_global_subscriptions):
+            if ticker not in request_tickers_set and ticker not in {"SBER", "YDEX", "LKOH"}:
+                command = {"action": "unsubscribe", "ticker": ticker}
+                await redis_client.publish("ticker_subscriptions", json.dumps(command))
+                current_global_subscriptions.remove(ticker)
+                print(f"[FASTAPI] Отправлена команда в Redis на отмену подписки: {ticker}")
+                
+        await redis_client.close()
+    except Exception as redis_err:
+        print(f"Ошибка отправки события в шину Redis Pub/Sub: {redis_err}")
+
     task = celery_app.send_task(
         "tasks.compute_portfolio_optimization",
         args=[
@@ -67,15 +95,12 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
 @app.get("/api/v1/tasks/{task_id}")
 async def get_task_status(task_id: str):
     task_result = AsyncResult(task_id, app=celery_app)
-    
     response = {
         "task_id": task_id,
         "status": task_result.status
     }
-    
     if task_result.status == "SUCCESS":
         response["result"] = task_result.result
     elif task_result.status == "FAILURE":
         response["error"] = str(task_result.info)
-        
     return response
