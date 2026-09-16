@@ -44,8 +44,17 @@ class MaxSharpeOptimiser(BaseOptimiser):
         bounds = tuple((min_bounds[i], max_bounds[i]) for i in range(num_assets))
         initial_weights = np.array([1.0 / num_assets] * num_assets)
         
+        # Запускаем оптимизацию
         result = minimize(fun=objective_function, x0=initial_weights, method='SLSQP', bounds=bounds, constraints=constraints)
+        
+        # --- ЛОГ СБОЯ SCIPY ---
+        print(f"[SCIPY ENGINE] Успешность: {result.success}")
+        print(f"[SCIPY ENGINE] Сообщение: {result.message}")
+        print(f"[SCIPY ENGINE] Сырой результат x: {result.x}")
+        # ----------------------
+        
         return pd.Series(np.round(result.x, 4), index=expected_returns.index)
+
 
 class OptimiserFactory:
     @staticmethod

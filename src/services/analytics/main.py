@@ -2,7 +2,6 @@
 import os
 import sys
 import json
-# Исправлено: Импортируем асинхронный Редис по официальному стандарту redis-py 5.x
 from redis import asyncio as aioredis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +35,7 @@ class OptimizationRequest(BaseModel):
     optimisation_strategy: str
     risk_aversion: float = 3.0
     days_to_forecast: int = 30
+    max_asset_weight: float = 1 
 
 @app.on_event("startup")
 async def startup_event():
@@ -75,15 +75,17 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
     except Exception as redis_err:
         print(f"Ошибка отправки события в шину Redis Pub/Sub: {redis_err}")
 
+    # ИСПРАВЛЕНО: Перевели отправку задачи с args на kwargs, чтобы исключить сдвиг позиций аргументов
     task = celery_app.send_task(
         "tasks.compute_portfolio_optimization",
-        args=[
-            request.selected_tickers,
-            request.model_name,
-            request.optimisation_strategy,
-            request.risk_aversion,
-            request.days_to_forecast
-        ]
+        kwargs={
+            "selected_tickers": request.selected_tickers,
+            "model_name": request.model_name,
+            "optimisation_strategy": request.optimisation_strategy,
+            "risk_aversion": request.risk_aversion,
+            "days_to_forecast": request.days_to_forecast,
+            "max_asset_weight": request.max_asset_weight
+        }
     )
     
     return {

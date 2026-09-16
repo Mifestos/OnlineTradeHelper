@@ -16,12 +16,17 @@ async function startOptimization() {
         return;
     }
 
+    // Считываем проценты с ползунка (например, 40) и делим на 100, превращая в долю (0.4)
+    const rawWeight = parseFloat(document.getElementById("maxAssetWeight").value);
+    const maxAssetWeightFloat = rawWeight / 100.0;
+
     const payload = {
         selected_tickers: selectedTickers,
         model_name: document.getElementById("modelName").value,
         optimisation_strategy: document.getElementById("strategyName").value,
         risk_aversion: parseFloat(document.getElementById("riskAversion").value),
-        days_to_forecast: 30
+        days_to_forecast: 30,
+        max_asset_weight: maxAssetWeightFloat // <-- ДОБАВЛЕНО
     };
 
     try {

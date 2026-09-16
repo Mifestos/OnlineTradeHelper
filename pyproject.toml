@@ -19,6 +19,7 @@ prophet = "^1.1.5"
 celery = "^5.4.0"
 python-dotenv = "^1.0.1"
 t-tech-investments = { version = "^1.49.2", source = "tbank" }
+psycopg2-binary = "^2.9.9"
 
 [[tool.poetry.source]]
 name = "tbank"

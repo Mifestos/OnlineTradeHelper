@@ -1,20 +1,20 @@
-version: '3.8'
-
 services:
+  # --- ИНФРАСТРУКТУРА ---
   timescaledb:
     image: timescale/timescaledb:latest-pg16
     container_name: trade_helper_timescaledb
     environment:
-      - POSTGRES_USER=trade_admin
-      - POSTGRES_PASSWORD=trade_secure_pass123
-      - POSTGRES_DB=trade_db
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
     ports:
       - "5432:5432"
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
     restart: unless-stopped
+    stop_grace_period: 30s
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U trade_admin -d trade_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -27,7 +27,74 @@ services:
     volumes:
       - redis_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # --- PYTHON СЕРВИСЫ ---
+  streamer:
+    build: .
+    container_name: oth_streamer
+    restart: always
+    command: python src/services/streamer/app.py
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=trade_helper_timescaledb
+      - REDIS_HOST=trade_helper_redis
+
+  api:
+    build: .
+    container_name: oth_api
+    restart: always
+    ports:
+      - "8000:8000"
+    command: uvicorn src.services.analytics.main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=trade_helper_timescaledb
+      - REDIS_HOST=trade_helper_redis
+
+  celery_worker:
+    build: .
+    container_name: oth_celery
+    restart: always
+    command: celery -A src.services.analytics.worker.celery_app worker --loglevel=info --pool=solo
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=trade_helper_timescaledb
+      - REDIS_HOST=trade_helper_redis
+
+  # --- ФРОНТЕНД ---
+  frontend:
+    image: python:3.12-slim
+    container_name: oth_frontend
+    working_dir: /app/src/ui
+    volumes:
+      - .:/app
+    ports:
+      - "8080:8080"
+    command: python -m http.server 8080 --bind 0.0.0.0
 
 volumes:
-  timescaledb_data:   
+  timescaledb_data:
   redis_data:

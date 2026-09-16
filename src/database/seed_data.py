@@ -2,67 +2,121 @@
 import os
 import sys
 import asyncio
-import numpy as np
-import pandas as pd
 from datetime import datetime, timedelta
+from pathlib import Path
+from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
+ENV_PATH = Path(BASE_DIR) / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+from t_tech.invest import AsyncClient
+from t_tech.invest.constants import INVEST_GRPC_API_SANDBOX
+from t_tech.invest.schemas import CandleInterval
 from src.database.connection import db_manager
 
-async def seed_historical_candles():
-    print("Запуск генерации исторических данных для обучения...")
-    await db_manager.connect()
+TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
+
+async def fetch_tinkoff_history(client, figi: str, ticker: str) -> list:
+    """Скачивает дневные свечи за последние 3 года, разбивая запрос на 3 куска по 1 году"""
+    now = datetime.utcnow()
     
-    tickers = ["SBER", "GAZP", "LKOH", "YDEX", "ROSN"]
-    base_prices = {"SBER": 250.0, "GAZP": 130.0, "LKOH": 7000.0, "YDEX": 4000.0, "ROSN": 500.0}
-    vols = {"SBER": 0.015, "GAZP": 0.012, "LKOH": 0.01, "YDEX": 0.025, "ROSN": 0.014}
-    
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=365 * 2)
-    
-    # Исправлено: Добавлен параметр tz='UTC' для генерации дат с часовым поясом
-    date_range = pd.date_range(start=start_date, end=end_date, freq='B', tz='UTC')
+    # ИСПРАВЛЕНО: Разбили историю на 3 интервала по 1 году (всего 3 года истории)
+    intervals = [
+        (now - timedelta(days=1095), now - timedelta(days=730)), # Первый год
+        (now - timedelta(days=730), now - timedelta(days=365)),  # Второй год
+        (now - timedelta(days=365), now)                         # Третий год
+    ]
     
     records = []
-    
-    for ticker in tickers:
-        current_price = base_prices[ticker]
-        vol = vols[ticker]
-        
-        for current_time in date_range:
-            returns = np.random.normal(0.0002, vol)
-            open_p = current_price * (1 + returns * 0.2)
-            close_p = current_price * (1 + returns)
-            high_p = max(open_p, close_p) * (1 + abs(np.random.normal(0, 0.003)))
-            low_p = min(open_p, close_p) * (1 - abs(np.random.normal(0, 0.003)))
-            volume = int(np.random.normal(50000, 15000))
+    for start, end in intervals:
+        try:
+            response = await client.market_data.get_candles(
+                figi=figi,
+                from_=start,
+                to=end,
+                interval=CandleInterval.CANDLE_INTERVAL_DAY
+            )
             
-            # current_time.to_pydatetime() переводит Timestamp в чистый datetime объект Python
-            records.append((
-                current_time.to_pydatetime(),
-                ticker,
-                round(open_p, 4),
-                round(close_p, 4),
-                round(high_p, 4),
-                round(low_p, 4),
-                max(100, volume)
-            ))
-            current_price = close_p
+            for candle in response.candles:
+                open_p = candle.open.units + (candle.open.nano / 1e9)
+                close_p = candle.close.units + (candle.close.nano / 1e9)
+                high_p = candle.high.units + (candle.high.nano / 1e9)
+                low_p = candle.low.units + (candle.low.nano / 1e9)
+                
+                dtvan = candle.time.replace(tzinfo=None)
+                
+                records.append((
+                    dtvan,
+                    ticker,
+                    round(open_p, 4),
+                    round(close_p, 4),
+                    round(high_p, 4),
+                    round(low_p, 4),
+                    int(candle.volume)
+                ))
+        except Exception as e:
+            print(f"[TINKOFF ERROR] Ошибка загрузки интервала для {ticker}: {e}")
+            
+    return records
 
-    print(f"Сгенерировано {len(records)} записей. Запись в TimescaleDB...")
+async def seed_historical_candles():
+    print("Запуск скачивания РЕАЛЬНЫХ исторических котировок за 3 ГОДА через API Т-Инвестиций...")
+    
+    if not TINKOFF_TOKEN or TINKOFF_TOKEN.startswith("t.mock"):
+        print("Ошибка: В .env файле не указан или указан неверный TINKOFF_TOKEN.")
+        return
+
+    CLEAN_TOKEN = TINKOFF_TOKEN.strip().replace('"', '').replace("'", "")
+    await db_manager.connect()
+    
+    all_records = []
+    
+    async with AsyncClient(CLEAN_TOKEN, target=INVEST_GRPC_API_SANDBOX) as client:
+        print("Загрузка справочника инструментов для поиска FIGI...")
+        shares_resp = await client.instruments.shares()
+        ticker_to_figi = {share.ticker: share.figi for share in shares_resp.instruments}
+        
+        target_tickers = ["SBER", "GAZP", "LKOH", "YDEX", "ROSN"]
+        
+        for ticker in target_tickers:
+            figi = ticker_to_figi.get(ticker)
+            if not figi:
+                print(f"Внимание: Не найден FIGI для тикера {ticker}")
+                continue
+                
+            print(f"Загрузка 3-летней истории для {ticker} через gRPC...")
+            records = await fetch_tinkoff_history(client, figi, ticker)
+            if records:
+                all_records.extend(records)
+                print(f"Успешно загружено {len(records)} свечей для {ticker}")
+            
+            # Легкая пауза 1.5 секунды, чтобы брокер не обрубил нас по лимитам частоты (Rate Limits)
+            await asyncio.sleep(1.5)
+
+    if not all_records:
+        print("Ошибка: Не удалось получить данные через API Т-Банка. База не изменена.")
+        await db_manager.disconnect()
+        return
+
+    # --- ДОБАВЛЕНО: Полная очистка дубликатов на стыках годов ---
+    all_records = list(set(all_records))
+    # -------------------------------------------------------------
+
+    print(f"Всего собрано {len(all_records)} уникальных записей. Запись в TimescaleDB...")
     
     async with db_manager.pool.acquire() as conn:
         await conn.execute("TRUNCATE TABLE candles;")
         await conn.copy_records_to_table(
             'candles',
-            records=records,
+            records=all_records,
             columns=['time', 'ticker', 'open', 'close', 'high', 'low', 'volume']
         )
         
-    print("База данных успешно наполнена историческими котировками.")
+    print("База данных успешно наполнена 3-летними котировками из Т-Инвестиций!")
     await db_manager.disconnect()
 
 if __name__ == "__main__":

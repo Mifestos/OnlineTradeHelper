@@ -59,6 +59,12 @@
         <input type="range" id="riskAversion" min="1.0" max="5.0" step="0.5" value="3.0" oninput="document.getElementById('riskValue').innerText=this.value">
     </div>
 
+    <!-- ДОБАВЛЕНО: Блок №5 для динамического управления лимитами портфеля -->
+    <div class="section">
+        <span class="section-title">5. Максимальная доля одного актива в портфеле: <span id="weightValue">40%</span></span>
+        <input type="range" id="maxAssetWeight" min="10" max="100" step="5" value="40" oninput="document.getElementById('weightValue').innerText=this.value + '%'">
+    </div>
+
     <button id="calculateBtn" onclick="startOptimization()">Запустить ИИ-оптимизацию</button>
 
     <div id="loader" class="loader">ИИ-воркер Celery обучается и рассчитывает веса... Подождите...</div>
@@ -77,6 +83,7 @@
     </div>
 </div>
 
-<script src="app.js"></script>
+<script src="app.js?v=1.0.1"></script>
+
 </body>
 </html>
