@@ -82,8 +82,10 @@ async def listen_redis_channels():
         await redis_client.close()
 
 async def handle_grpc_stream(client):
+    # Инициализируем отдельный клиент Redis для записи свечей
+    redis_writer = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    
     async def request_iterator():
-        # ИСПРАВЛЕНО: Если на старте сайт еще ничего не запросил, мы просто пишем лог и пропускаем стартовую отправку
         if active_tickers:
             initial_instruments = []
             for ticker in list(active_tickers):
@@ -102,7 +104,6 @@ async def handle_grpc_stream(client):
         else:
             print("gRPC поток инициализирован без стартовых подписок. Ожидание первого клика на сайте...")
         
-        # Бесконечно ждем динамических команд из очереди Redis Pub/Sub
         while True:
             cmd = await subscription_queue.get()
             yield MarketDataRequest(
@@ -122,9 +123,25 @@ async def handle_grpc_stream(client):
                 
                 open_price = candle.open.units + (candle.open.nano / 1e9)
                 close_price = candle.close.units + (candle.close.nano / 1e9)
+                timestamp = int(candle.time.timestamp())
                 
                 print(f"🕒 [{candle.time.strftime('%H:%M:%S')}] Свеча {ticker} -> Close: {close_price} руб.")
                 
+                # --- ДОБАВЛЕНО: Сохранение онлайн-хвоста в Redis ZSET ---
+                redis_key = f"candles:live:{ticker}"
+                candle_data = json.dumps({
+                    "time": candle.time.isoformat(),
+                    "open": open_price,
+                    "close": close_price,
+                    "volume": candle.volume
+                })
+                # Добавляем свечу в Sorted Set, где score — это timestamp
+                await redis_writer.zadd(redis_key, {candle_data: timestamp})
+                # Храним в Redis только последние 3 дня (259200 секунд), чтобы не переполнять память
+                await redis_writer.zremrangebyscore(redis_key, "-inf", timestamp - 259200)
+                # --------------------------------------------------------
+
+                # Запись в PostgreSQL (оставляем как было для истории)
                 async with db_manager.pool.acquire() as conn:
                     await conn.execute(
                         """
@@ -136,6 +153,9 @@ async def handle_grpc_stream(client):
                     )
     except asyncio.CancelledError:
         pass
+    finally:
+        await redis_writer.close() # Закрываем соединение при остановке стримера
+
 
 async def main():
     if not TINKOFF_TOKEN or TINKOFF_TOKEN.startswith("t.mock"):
