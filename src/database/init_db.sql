@@ -55,3 +55,25 @@ CREATE TABLE IF NOT EXISTS optimization_runs (
 
 CREATE INDEX IF NOT EXISTS idx_optimization_runs_time 
     ON optimization_runs (run_at DESC);
+    
+-- ============================================================================
+-- Расписания ежедневной оптимизации
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id SERIAL PRIMARY KEY,
+    profile_name VARCHAR(100),
+    model_name VARCHAR(50) NOT NULL,
+    optimisation_strategy VARCHAR(50) NOT NULL,
+    tickers TEXT[] NOT NULL,
+    risk_aversion DOUBLE PRECISION NOT NULL,
+    max_asset_weight DOUBLE PRECISION NOT NULL,
+    run_hour INT NOT NULL DEFAULT 19,
+    run_minute INT NOT NULL DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_run_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedules_active 
+    ON schedules (is_active, run_hour, run_minute);
