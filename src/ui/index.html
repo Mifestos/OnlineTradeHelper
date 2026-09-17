@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>OnlineTradeHelper Dashboard</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f6f9; color: #333; margin: 0; padding: 40px; }
+        .container { max-width: 640px; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); margin: 0 auto; }
+        h1 { margin-top: 0; font-size: 24px; color: #111; border-bottom: 2px solid #f0f2f5; padding-bottom: 15px; }
+        .section { margin-bottom: 25px; }
+        .section-title { font-weight: 600; margin-bottom: 10px; display: block; color: #444; }
+        .checkbox-group { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        .checkbox-item { display: flex; align-items: center; gap: 8px; background: #f8fafc; padding: 10px; border-radius: 6px; cursor: pointer; border: 1px solid #e2e8f0; }
+
+        /* === Профили === */
+        .profiles-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+        .profile-card {
+            position: relative;
+            display: flex; flex-direction: column; gap: 6px;
+            padding: 16px 20px; border: 2px solid #e2e8f0; border-radius: 10px;
+            cursor: pointer; transition: all 0.15s; background: #fff;
+        }
+        .profile-card:hover { border-color: #93c5fd; background: #f8fafc; }
+        .profile-card.selected { border-color: #2563eb; background: #eff6ff; box-shadow: 0 2px 8px rgba(37,99,235,0.15); }
+        .profile-card .title { font-size: 17px; font-weight: 600; color: #111; }
+        .profile-card .desc { font-size: 13px; color: #64748b; }
+        .profile-card .params { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+
+        /* === Свернутый блок ручных настроек === */
+        .manual-toggle {
+            display: inline-block; margin-top: 10px; padding: 10px 16px;
+            background: #f1f5f9; border: 1px dashed #cbd5e1;
+            border-radius: 6px; color: #475569; cursor: pointer; font-size: 14px;
+        }
+        .manual-toggle:hover { background: #e2e8f0; }
+        .manual-section { display: none; margin-top: 20px; padding: 20px; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }
+        .manual-section.open { display: block; }
+
+        select, input[type="range"], button { width: 100%; padding: 12px; border-radius: 6px; border: 1px solid #cbd5e1; box-sizing: border-box; font-size: 15px; }
+        .run-btn { background: #2563eb; color: white; border: none; font-weight: 600; cursor: pointer; margin-top: 15px; transition: background 0.2s; }
+        .run-btn:hover { background: #1d4ed8; }
+        .run-btn:disabled { background: #94a3b8; cursor: not-allowed; }
+        .loader { display: none; text-align: center; margin-top: 20px; font-weight: 500; color: #2563eb; }
+        .results-box { display: none; margin-top: 25px; background: #f0fdf4; border: 1px solid #bbf7d0; padding: 20px; border-radius: 8px; }
+        .results-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        .results-table th, .results-table td { padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: left; }
+        .results-table th { font-weight: 600; color: #444; }
+
+        /* === История === */
+        .history-title {
+            cursor: pointer; user-select: none;
+            display: flex; align-items: center; justify-content: space-between;
+        }
+        .history-title:hover { color: #2563eb; }
+        #historyArrow { font-size: 18px; color: #94a3b8; transition: transform 0.15s; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>OnlineTradeHelper AI Optimization</h1>
+
+    <div class="section">
+        <span class="section-title">1. Выберите акции для портфеля:</span>
+        <div class="checkbox-group">
+            <label class="checkbox-item"><input type="checkbox" name="tickers" value="SBER" checked> SBER</label>
+            <label class="checkbox-item"><input type="checkbox" name="tickers" value="YDEX" checked> YDEX</label>
+            <label class="checkbox-item"><input type="checkbox" name="tickers" value="LKOH" checked> LKOH</label>
+            <label class="checkbox-item"><input type="checkbox" name="tickers" value="GAZP"> GAZP</label>
+            <label class="checkbox-item"><input type="checkbox" name="tickers" value="ROSN"> ROSN</label>
+        </div>
+    </div>
+
+    <div class="section">
+        <span class="section-title">2. Выберите риск-профиль:</span>
+        <div class="profiles-grid" id="profilesGrid">
+            <div class="profile-card" data-profile="loading">Загрузка профилей...</div>
+        </div>
+        <div class="manual-toggle" onclick="toggleManual()">
+            ⚙️ Настроить вручную
+        </div>
+    </div>
+
+    <!-- === Свернутый блок ручных настроек === -->
+    <div class="manual-section" id="manualSection">
+        <div class="section">
+            <span class="section-title">Модель прогноза:</span>
+            <select id="modelName">
+                <option value="">Загрузка моделей...</option>
+            </select>
+        </div>
+
+        <div class="section">
+            <span class="section-title">Стратегия оптимизации:</span>
+            <select id="strategyName">
+                <option value="max_sharpe">Максимальный коэффициент Шарпа</option>
+                <option value="markowitz">Модель Марковица</option>
+            </select>
+        </div>
+
+        <div class="section">
+            <span class="section-title">Неприятие риска (γ): <span id="riskValue">3.0</span></span>
+            <input type="range" id="riskAversion" min="1.0" max="5.0" step="0.5" value="3.0" oninput="document.getElementById('riskValue').innerText=this.value">
+        </div>
+
+        <div class="section">
+            <span class="section-title">Максимальная доля одного актива: <span id="weightValue">40%</span></span>
+            <input type="range" id="maxAssetWeight" min="10" max="100" step="5" value="40" oninput="document.getElementById('weightValue').innerText=this.value + '%'">
+        </div>
+    </div>
+
+    <!-- === Блок сохранения кастомного профиля === -->
+    <div id="saveProfileBox" style="display: none; margin-top: 16px; padding: 16px; background: #eff6ff; border: 1px solid #93c5fd; border-radius: 8px;">
+        <div style="font-weight: 600; color: #1e40af; margin-bottom: 12px;">💾 Сохранить текущие настройки как профиль</div>
+
+        <input type="text" id="profileName" placeholder="Название (например, 'Мой агрессивный')"
+               style="width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; margin-bottom: 8px; box-sizing: border-box;">
+
+        <input type="text" id="profileDescription" placeholder="Описание (необязательно)"
+               style="width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; margin-bottom: 12px; box-sizing: border-box;">
+
+        <button onclick="saveCustomProfile()"
+                style="width: 100%; padding: 10px; background: #2563eb; color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer;">
+            Сохранить профиль
+        </button>
+    </div>
+
+    <button id="calculateBtn" class="run-btn" onclick="startOptimization()">Запустить ИИ-оптимизацию</button>
+
+    <div id="loader" class="loader">ИИ-воркер Celery обучается и рассчитывает веса... Подождите...</div>
+
+    <div id="resultsBox" class="results-box">
+        <span class="section-title" style="color: #166534;">✓ Идеальное распределение портфеля:</span>
+        <table class="results-table">
+            <thead>
+                <tr>
+                    <th>Акция (Тикер)</th>
+                    <th>Оптимальная доля (%)</th>
+                </tr>
+            </thead>
+            <tbody id="resultsBody"></tbody>
+        </table>
+    </div>
+
+    <!-- === История оптимизаций === -->
+    <div class="section" style="margin-top: 30px; border-top: 2px solid #f0f2f5; padding-top: 20px;">
+        <span class="section-title history-title" onclick="toggleHistory()">
+            <span>📜 История оптимизаций</span>
+            <span id="historyArrow">▸</span>
+        </span>
+        <div id="historySection" style="display: none; margin-top: 12px;">
+            <button onclick="loadHistory()"
+                    style="width: auto; padding: 8px 16px; margin-bottom: 12px; background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; border-radius: 6px; cursor: pointer; font-size: 14px;">
+                🔄 Обновить
+            </button>
+            <div id="historyContent">
+                <div style="text-align: center; color: #94a3b8; padding: 20px;">
+                    Нажмите «Обновить» для загрузки истории
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="app.js?v=1.0.5"></script>
+
+</body>
+</html>

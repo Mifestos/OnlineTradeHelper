@@ -1,0 +1,34 @@
+[tool.poetry]
+name = "onlinetradehelper"
+version = "1.0.0"
+description = "AI-Driven Real-Time Asset Allocation Platform on MOEX"
+authors = ["Mifestos"]
+readme = "README.md"
+packages = [{include = "src"}] 
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.111.0"
+uvicorn = {extras = ["standard"], version = "^0.30.0"}
+asyncpg = "^0.29.0"
+redis = "^5.0.0"
+numpy = "^1.26.4"
+scipy = "^1.13.0"
+pandas = "^2.2.0"
+prophet = "^1.1.5"
+celery = "^5.4.0"
+python-dotenv = "^1.0.1"
+t-tech-investments = { version = "^1.49.2", source = "tbank" }
+psycopg2-binary = "^2.9.9"
+xgboost = "^2.0.3"
+scikit-learn = "^1.5.0"
+
+
+[[tool.poetry.source]]
+name = "tbank"
+url = "https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple"
+priority = "supplemental"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
