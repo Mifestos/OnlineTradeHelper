@@ -2,11 +2,11 @@
 import os
 import sys
 import json
+from typing import List, Optional
 from redis import asyncio as aioredis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
 from celery.result import AsyncResult
 
 app = FastAPI(title="OnlineTradeHelper AI Analytics Core")
@@ -25,74 +25,125 @@ if BASE_DIR not in sys.path:
 
 from src.database.connection import db_manager
 from src.services.analytics.worker import celery_app
+from src.services.analytics.models import ModelRegistry
+from src.services.analytics.profiles import list_profiles, resolve_profile_or_default
 from src.settings import REDIS_HOST, REDIS_PORT
 
 current_global_subscriptions = set()
 
+
 class OptimizationRequest(BaseModel):
     selected_tickers: List[str]
-    model_name: str
-    optimisation_strategy: str
+    # Профиль (опционально):
+    profile_name: Optional[str] = None
+    # Ручные параметры (используются, если profile_name не задан):
+    model_name: Optional[str] = None
+    optimisation_strategy: Optional[str] = None
     risk_aversion: float = 3.0
     days_to_forecast: int = 30
-    max_asset_weight: float = 1 
+    max_asset_weight: float = 1.0
+
 
 @app.on_event("startup")
 async def startup_event():
     await db_manager.init_tables()
     print("Бэкенд-API успешно запущен")
 
+
 @app.on_event("shutdown")
 async def shutdown_event():
     await db_manager.disconnect()
     print("Соединения бэкенда безопасно закрыты")
 
+
+@app.get("/api/v1/models")
+async def list_models():
+    """Список доступных моделей прогноза."""
+    return {"models": ModelRegistry.list_available()}
+
+
+@app.get("/api/v1/profiles")
+async def list_risk_profiles():
+    """Список доступных профилей риска."""
+    return {"profiles": list_profiles()}
+
+
 @app.post("/api/v1/optimize")
 async def optimize_portfolio_endpoint(request: OptimizationRequest):
     global current_global_subscriptions
+
     if not request.selected_tickers:
         raise HTTPException(status_code=400, detail="Список тикеров не может быть пустым")
-    
+
+    # Разрешаем параметры: профиль имеет приоритет над ручными настройками
+    profile = resolve_profile_or_default(request.profile_name)
+
+    if profile:
+        resolved_model = profile["model_name"]
+        resolved_strategy = profile["optimisation_strategy"]
+        resolved_risk_aversion = profile["risk_aversion"]
+        resolved_days = profile["days_to_forecast"]
+        resolved_max_weight = profile["max_asset_weight"]
+        print(f"[FASTAPI] Применён профиль: {profile['display_name']}")
+    else:
+        resolved_model = request.model_name
+        resolved_strategy = request.optimisation_strategy
+        resolved_risk_aversion = request.risk_aversion
+        resolved_days = request.days_to_forecast
+        resolved_max_weight = request.max_asset_weight
+        print(f"[FASTAPI] Ручной режим: model={resolved_model}, strategy={resolved_strategy}")
+
+    # Валидация модели
+    if resolved_model not in ModelRegistry.list_names():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Модель '{resolved_model}' не найдена. "
+                   f"Доступные: {ModelRegistry.list_names()}"
+        )
+
+    # Управление подписками в Redis Pub/Sub
     try:
         redis_client = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
         request_tickers_set = set(request.selected_tickers)
-        
+
         for ticker in request_tickers_set:
             if ticker not in current_global_subscriptions:
                 command = {"action": "subscribe", "ticker": ticker}
                 await redis_client.publish("ticker_subscriptions", json.dumps(command))
                 current_global_subscriptions.add(ticker)
                 print(f"[FASTAPI] Отправлена команда в Redis на подписку: {ticker}")
-                
+
         for ticker in list(current_global_subscriptions):
-            if ticker not in request_tickers_set and ticker not in {"SBER", "YDEX", "LKOH"}:
+            if ticker not in request_tickers_set:
                 command = {"action": "unsubscribe", "ticker": ticker}
                 await redis_client.publish("ticker_subscriptions", json.dumps(command))
                 current_global_subscriptions.remove(ticker)
                 print(f"[FASTAPI] Отправлена команда в Redis на отмену подписки: {ticker}")
-                
+
         await redis_client.close()
     except Exception as redis_err:
         print(f"Ошибка отправки события в шину Redis Pub/Sub: {redis_err}")
 
-    # ИСПРАВЛЕНО: Перевели отправку задачи с args на kwargs, чтобы исключить сдвиг позиций аргументов
+    # Отправляем задачу в Celery
     task = celery_app.send_task(
         "tasks.compute_portfolio_optimization",
         kwargs={
             "selected_tickers": request.selected_tickers,
-            "model_name": request.model_name,
-            "optimisation_strategy": request.optimisation_strategy,
-            "risk_aversion": request.risk_aversion,
-            "days_to_forecast": request.days_to_forecast,
-            "max_asset_weight": request.max_asset_weight
+            "model_name": resolved_model,
+            "optimisation_strategy": resolved_strategy,
+            "risk_aversion": resolved_risk_aversion,
+            "days_to_forecast": resolved_days,
+            "max_asset_weight": resolved_max_weight,
         }
     )
-    
+
     return {
         "status": "pending",
-        "message": "Задача оптимизации успешно отправлена в фоновую очередь расчета.",
-        "task_id": task.id
+        "message": "Задача оптимизации отправлена.",
+        "task_id": task.id,
+        "applied_profile": profile["name"] if profile else None,
     }
+
 
 @app.get("/api/v1/tasks/{task_id}")
 async def get_task_status(task_id: str):

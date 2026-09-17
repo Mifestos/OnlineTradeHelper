@@ -1,13 +1,10 @@
 # src/services/analytics/worker.py
 import os
 import sys
-import json
 import ssl
-import time
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
-import redis
 import psycopg2  # Синхронный клиент для Celery
 import xml.etree.ElementTree as ET
 from urllib.request import Request, urlopen
@@ -18,7 +15,7 @@ if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
 from src.settings import REDIS_HOST, REDIS_PORT, DATABASE_URL
-from src.services.analytics.models import ModelFactory
+from src.services.analytics.models import ModelRegistry
 from src.services.analytics.optimiser import OptimiserFactory
 
 celery_app = Celery(
@@ -27,19 +24,10 @@ celery_app = Celery(
     backend=f"redis://{REDIS_HOST}:{REDIS_PORT}/0"
 )
 
-# Таймаут ожидания готовности streamer'а (в секундах).
-# Должен быть с запасом перекрывать интервал первой свечи streamer'а:
-#   - симуляция: 5 сек
-#   - боевой стрим: ~60 сек
-READY_WAIT_TIMEOUT = float(os.getenv("READY_WAIT_TIMEOUT", "90.0"))
-
 
 def get_actual_cbr_key_rate() -> float:
     """
     Скачивает актуальную ключевую ставку с SOAP-сервиса ЦБ РФ.
-    Метод KeyRateXML требует обязательные параметры fromDate и ToDate.
-    В ответе ЦБ дата лежит в теге <DT>, ставка — в <Rate>.
-    Записи сортируются по дате — берётся самая свежая.
     """
     url = "https://www.cbr.ru/DailyInfoWebServ/DailyInfo.asmx"
 
@@ -107,49 +95,6 @@ def get_actual_cbr_key_rate() -> float:
     return 0.14
 
 
-def wait_for_live_data(tickers: list, timeout: float = READY_WAIT_TIMEOUT) -> bool:
-    """
-    Инженерное ожидание готовности streamer'а через Redis-флаги.
-
-    Логика:
-    1. Быстрая проверка — если флаг `streamer:ready:{ticker}` уже стоит,
-       тикер готов, ждать не нужно.
-    2. Если флага нет — worker блокирующе ждёт сигнала через BLPOP
-       из очереди `streamer:ready_queue` с общим таймаутом.
-
-    Возвращает True, если все тикеры готовы, False при таймауте.
-    """
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-    start = time.time()
-
-    # Шаг 1: быстрая проверка — кто уже готов
-    missing = {t for t in tickers if not r.exists(f"streamer:ready:{t}")}
-
-    if not missing:
-        print(f"[REDIS WAIT] ✅ Все тикеры уже готовы (флаги стояли)")
-        return True
-
-    print(f"[REDIS WAIT] Ожидание готовности: {missing} (таймаут {timeout}с)...")
-
-    # Шаг 2: блокирующее ожидание сигналов через BLPOP
-    while missing and (time.time() - start) < timeout:
-        remaining_timeout = max(1, int(timeout - (time.time() - start)))
-        # BLPOP блокирует до появления элемента или таймаута
-        result = r.blpop("streamer:ready_queue", timeout=remaining_timeout)
-        if result:
-            _, ticker = result
-            print(f"[REDIS WAIT] 📩 Получен сигнал готовности: {ticker}")
-            missing.discard(ticker)
-
-    if not missing:
-        elapsed = time.time() - start
-        print(f"[REDIS WAIT] ✅ Все тикеры готовы за {elapsed:.2f}с")
-        return True
-
-    print(f"[REDIS WAIT] ⏱ Таймаут {timeout}с. Не дождались: {missing}")
-    return False
-
-
 def load_history_from_timescaledb(tickers: list) -> pd.DataFrame:
     """Загружает реальные исторические дневные свечи из TimescaleDB"""
     print(f"[DB READ] Запрос истории из TimescaleDB для: {tickers}")
@@ -179,35 +124,6 @@ def load_history_from_timescaledb(tickers: list) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def load_live_data_from_redis(tickers: list) -> pd.DataFrame:
-    """Загружает самые свежие минутные свечи из Redis и формирует DataFrame цены Close"""
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-    combined_data = {}
-
-    for ticker in tickers:
-        redis_key = f"candles:live:{ticker}"
-        raw_candles = r.zrange(redis_key, 0, -1)
-
-        times = []
-        closes = []
-        for raw in raw_candles:
-            candle = json.loads(raw)
-            times.append(pd.to_datetime(candle["time"]).tz_localize(None))
-            closes.append(float(candle["close"]))
-
-        if closes:
-            combined_data[ticker] = pd.Series(closes, index=times)
-            print(f"[REDIS READ] Извлечено {len(closes)} живых свечей для {ticker}")
-        else:
-            print(f"[REDIS READ] Для {ticker} live-свечей не найдено")
-
-    if not combined_data:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(combined_data).sort_index().ffill()
-    return df
-
-
 @celery_app.task(name="tasks.compute_portfolio_optimization")
 def compute_portfolio_optimization(
     selected_tickers: list,
@@ -217,18 +133,17 @@ def compute_portfolio_optimization(
     days_to_forecast: int,
     max_asset_weight: float = 1.0,
 ) -> dict:
-    # Мониторинг входящих параметров
-    print(f"[CELERY WORKER] Входящий max_asset_weight: {max_asset_weight} (тип: {type(max_asset_weight)})")
+    print(f"[CELERY WORKER] Входящий max_asset_weight: {max_asset_weight}")
     print(f"[CELERY WORKER] Начало выполнения задачи для тикеров: {selected_tickers}")
     num_assets = len(selected_tickers)
 
-    # 1. Загружаем реальную историю из TimescaleDB
-    base_history = load_history_from_timescaledb(selected_tickers)
+    # 1. Загружаем дневную историю из TimescaleDB
+    full_history = load_history_from_timescaledb(selected_tickers)
 
-    # Резервный фолбэк: если база пустая, создаем временный фрейм
-    if base_history.empty:
+    # Фолбэк: если данных нет
+    if full_history.empty:
         print("[CELERY WORKER] Внимание: Истории в БД нет. Временный откат на генерацию.")
-        base_history = pd.DataFrame(
+        full_history = pd.DataFrame(
             {t: np.random.normal(100, 2, 100).cumsum() for t in selected_tickers},
             index=pd.date_range(
                 end=pd.Timestamp.now() - pd.Timedelta(days=1),
@@ -237,41 +152,48 @@ def compute_portfolio_optimization(
             ).tz_localize(None),
         )
 
-    # 2. Ждём сигнал готовности streamer'а через Redis-флаги и BLPOP
-    wait_for_live_data(selected_tickers)
+    # 2. Нормализация индекса и дедупликация
+    full_history.index = pd.to_datetime(full_history.index).normalize().tz_localize(None)
+    full_history = full_history[~full_history.index.duplicated(keep="last")].sort_index()
+    full_history = full_history.loc[:, ~full_history.columns.duplicated()]
 
-    # 3. Подтягиваем «живой хвост» реалтайм-данных из Redis
-    live_history = load_live_data_from_redis(selected_tickers)
+    print(f"[CELERY WORKER] История: {len(full_history)} дней, "
+          f"тикеры: {list(full_history.columns)}")
 
-    # 4. Склеиваем историю с живыми данными
-    if not live_history.empty:
-        live_daily = live_history.resample("D").last().ffill()
-        full_history = pd.concat([base_history, live_daily])
-        # Оставляем последнюю запись для каждой даты
-        full_history = full_history[~full_history.index.duplicated(keep="last")].sort_index()
-        print("[CELERY WORKER] Живой хвост из Redis успешно пристыкован к истории.")
-    else:
-        full_history = base_history
-        print("[CELERY WORKER] Данных в Redis не обнаружено, расчет по исторической базе данных.")
+    # 3. Обучение модели через ModelRegistry
+    print(f"[CELERY WORKER] Запуск модели: {model_name}")
+    try:
+        model = ModelRegistry.get(model_name)
+        model_output = model.fit_predict(
+            full_history,
+            days_to_forecast=days_to_forecast,
+        )
 
-    # 5. Рассчитываем реальные доходности и ковариацию на основе склеенных данных
-    returns_df = full_history.pct_change(fill_method=None).dropna()
-    expected_returns = returns_df.mean() * 252
-    cov_matrix = returns_df.cov() * 252
+        expected_returns = model_output.expected_returns
+        cov_matrix = model_output.cov_matrix
 
-    if cov_matrix.isna().values.any() or (np.diag(cov_matrix) == 0).any():
+        print(f"[CELERY WORKER] Модель '{model.name}' вернула прогноз:")
+        print(f"[CELERY WORKER]   Ожидаемые годовые доходности:")
+        print(expected_returns.to_string())
+        print(f"[CELERY WORKER]   Метаданные: {model_output.model_metadata}")
+
+    except Exception as e:
+        print(f"[CELERY WORKER] Ошибка модели '{model_name}': {e}")
+        print("[CELERY WORKER] Откат на исторические доходности.")
+        returns_df = full_history.pct_change(fill_method=None).dropna()
+        expected_returns = returns_df.mean() * 252
+        cov_matrix = returns_df.cov() * 252
+
+    # 4. Фолбэк ковариации
+    if cov_matrix is None or cov_matrix.isna().values.any() or (np.diag(cov_matrix) == 0).any():
+        print("[CELERY WORKER] Ковариация невалидна, использую единичную матрицу.")
         cov_matrix = pd.DataFrame(
             np.eye(num_assets) * 0.04,
             index=selected_tickers,
             columns=selected_tickers,
         )
 
-    # 6. Обучение ИИ-модели Prophet
-    model = ModelFactory.get_model(model_name)
-    print(f"[CELERY WORKER] Запуск обучения модели {model_name}...")
-    forecasted_prices = model.fit_forecast(full_history, days_to_forecast)
-
-    # 7. Оптимизация портфеля Марковица / Шарпа
+    # 5. Оптимизация портфеля
     min_bounds = [0.0] * num_assets
     max_bounds = [max_asset_weight] * num_assets
 
@@ -280,12 +202,11 @@ def compute_portfolio_optimization(
     print(f"[MATHEMATICS DASHBOARD] Сформированные min_bounds: {min_bounds}")
     print(f"[MATHEMATICS DASHBOARD] Сформированные max_bounds: {max_bounds}")
 
-    # Автоматически подтягиваем реальную ключевую ставку с API Центробанка
     current_risk_free_rate = get_actual_cbr_key_rate()
     print(f"[CELERY WORKER] Безрисковая ставка для оптимизации: {current_risk_free_rate}")
 
     optimiser = OptimiserFactory.get_optimiser(optimisation_strategy)
-    optimized_weights = optimiser.optimize(
+    optimiser_result = optimiser.optimize(
         expected_returns=expected_returns,
         cov_matrix=cov_matrix,
         min_bounds=min_bounds,
@@ -294,11 +215,26 @@ def compute_portfolio_optimization(
         risk_free_rate=current_risk_free_rate,
     )
 
+    # 6. Считаем остаток — сколько осталось в наличных
+    weights_dict = optimiser_result["weights"].to_dict()
+    total_invested = sum(weights_dict.values())
+    cash_weight = round(max(0.0, 1.0 - total_invested), 4)
+
+    if cash_weight > 0.001:
+        print(f"[CELERY WORKER] ⚠️ Не все средства распределены. "
+              f"В наличных: {cash_weight * 100:.2f}%")
+    else:
+        cash_weight = 0.0
+
     print("[CELERY WORKER] Расчет успешно завершен.")
     return {
         "status": "success",
         "applied_model": model_name,
         "applied_strategy": optimisation_strategy,
         "risk_free_rate": current_risk_free_rate,
-        "weights": optimized_weights.to_dict(),
+        "weights": weights_dict,
+        "cash_weight": cash_weight,
+        "optimiser_success": optimiser_result["success"],
+        "fallback_used": optimiser_result["fallback_used"],
+        "optimiser_message": optimiser_result["message"],
     }
