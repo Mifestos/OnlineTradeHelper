@@ -1,10 +1,14 @@
 # src/services/streamer/app.py
 import os
 import sys
+
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import asyncio
 import json
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 import redis.asyncio as aioredis
@@ -21,8 +25,24 @@ from src.settings import REDIS_HOST, REDIS_PORT
 
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN")
 
-# Режим работы: "true" — песочница с симуляцией, "false" — боевой токен с реальным стримом
+# --- Определение режима работы ---
 USE_SANDBOX = os.getenv("USE_SANDBOX", "true").lower() == "true"
+SANDBOX_MODE = os.getenv("SANDBOX_MODE", "simulation").lower()  # "simulation" | "real"
+SANDBOX_POLL_INTERVAL = int(os.getenv("SANDBOX_POLL_INTERVAL", "60"))
+
+# Фактический режим:
+#   "sandbox_simulation" — генерируем свечи сами (быстро, без API)
+#   "sandbox_real"       — тянем реальные свечи через GetCandles
+#   "production"         — реальный MarketDataStream (боевой токен)
+if not USE_SANDBOX:
+    STREAM_MODE = "production"
+elif SANDBOX_MODE == "real":
+    STREAM_MODE = "sandbox_real"
+else:
+    STREAM_MODE = "sandbox_simulation"
+
+print(f"[CONFIG] USE_SANDBOX={USE_SANDBOX}, SANDBOX_MODE={SANDBOX_MODE}")
+print(f"[CONFIG] STREAM_MODE={STREAM_MODE}")
 
 # Список инструментов для симуляции в песочнице
 SANDBOX_SIMULATED_TICKERS = ["SBER", "YDEX", "LKOH", "GAZP", "ROSN"]
@@ -35,6 +55,9 @@ SANDBOX_BASE_PRICES = {
     "GAZP": 130.0,
     "ROSN": 550.0,
 }
+
+# TTL флага готовности (в секундах)
+READY_FLAG_TTL = 60
 
 active_tickers = set()
 figi_to_ticker = {}
@@ -59,12 +82,6 @@ async def sync_instruments(client):
 async def validate_production_connection(client):
     """
     Проверяет, что мы действительно подключены к боевому контуру T-Invest.
-    Запускается один раз при старте стримера в боевом режиме.
-
-    Признаки боевого контура:
-      - GetAccounts возвращает хотя бы один счёт.
-      - Счета имеют тип BROKER, IIS, INVEST_BOX и т.п.
-      - Нет ошибок авторизации.
     """
     try:
         response = await client.users.get_accounts()
@@ -109,19 +126,23 @@ async def listen_redis_channels():
                     if not ticker:
                         continue
 
-                    # В песочнице разрешаем только симулированные тикеры
-                    if USE_SANDBOX and ticker not in SANDBOX_SIMULATED_TICKERS:
-                        print(f"[REDIS EVENT] Песочница: тикер {ticker} не поддерживается в симуляции")
+                    # В симуляции разрешаем только известные тикеры
+                    if STREAM_MODE == "sandbox_simulation" and ticker not in SANDBOX_SIMULATED_TICKERS:
+                        print(f"[REDIS EVENT] Симуляция: тикер {ticker} не поддерживается")
                         continue
 
-                    if not USE_SANDBOX and ticker not in ticker_to_figi:
+                    # В реальных режимах тикер должен быть в справочнике
+                    if STREAM_MODE != "sandbox_simulation" and ticker not in ticker_to_figi:
                         print(f"[REDIS EVENT] Тикер {ticker} не найден в справочнике")
                         continue
 
                     if action == "subscribe" and ticker not in active_tickers:
                         print(f"[REDIS EVENT] Подписка на тикер: {ticker}")
                         active_tickers.add(ticker)
-                        if not USE_SANDBOX:
+                        # Сбрасываем флаг готовности — streamer опубликует его заново
+                        await redis_client.delete(f"streamer:ready:{ticker}")
+                        # В production нужно уведомить MarketDataStream
+                        if STREAM_MODE == "production":
                             await subscription_queue.put({
                                 "action": 1,
                                 "figi": ticker_to_figi[ticker],
@@ -131,7 +152,8 @@ async def listen_redis_channels():
                     elif action == "unsubscribe" and ticker in active_tickers:
                         print(f"[REDIS EVENT] Отписка от тикера: {ticker}")
                         active_tickers.remove(ticker)
-                        if not USE_SANDBOX:
+                        await redis_client.delete(f"streamer:ready:{ticker}")
+                        if STREAM_MODE == "production":
                             await subscription_queue.put({
                                 "action": 2,
                                 "figi": ticker_to_figi[ticker],
@@ -152,14 +174,14 @@ async def listen_redis_channels():
 
 async def simulate_candles():
     """
-    Симуляция свечей для песочницы.
-    Генерирует случайные свечи по выбранным тикерам раз в 5 секунд
-    и пишет их в Redis в том же формате, что и реальный стрим.
+    РЕЖИМ sandbox_simulation.
+    Генерирует случайные свечи и публикует сигнал готовности после первой свечи.
     """
-    print("[SIMULATION] Запуск симуляции свечей (песочница)")
+    print("[SIMULATION] Запуск симуляции свечей (без обращения к T-Invest)")
     redis_writer = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
     current_prices = dict(SANDBOX_BASE_PRICES)
+    ready_tickers = set()
 
     try:
         while True:
@@ -190,6 +212,13 @@ async def simulate_candles():
                 await redis_writer.zadd(redis_key, {candle_data: timestamp})
                 await redis_writer.zremrangebyscore(redis_key, "-inf", timestamp - 259200)
 
+                # Публикуем сигнал готовности один раз
+                if ticker not in ready_tickers:
+                    ready_tickers.add(ticker)
+                    await redis_writer.set(f"streamer:ready:{ticker}", "1", ex=READY_FLAG_TTL)
+                    await redis_writer.lpush("streamer:ready_queue", ticker)
+                    print(f"[SIMULATION] ✅ Тикер {ticker} готов (сигнал отправлен)")
+
                 print(f"🕒 [SIMULATION] Свеча {ticker} -> Close: {close_price} руб.")
 
             await asyncio.sleep(5)
@@ -200,12 +229,86 @@ async def simulate_candles():
         await redis_writer.aclose()
 
 
+async def poll_real_candles_sandbox(client):
+    """
+    РЕЖИМ sandbox_real.
+    Опрашивает GetCandles раз в SANDBOX_POLL_INTERVAL секунд,
+    пишет реальные свечи в Redis и публикует сигнал готовности.
+    """
+    print(f"[SANDBOX REAL] Запуск опроса GetCandles (интервал {SANDBOX_POLL_INTERVAL}с)")
+    redis_writer = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    ready_tickers = set()
+
+    try:
+        while True:
+            if not active_tickers:
+                await asyncio.sleep(2.0)
+                continue
+
+            for ticker in list(active_tickers):
+                figi = ticker_to_figi.get(ticker)
+                if not figi:
+                    continue
+
+                try:
+                    now = datetime.now()
+                    from_time = now - timedelta(minutes=5)
+
+                    response = await client.market_data.get_candles(
+                        figi=figi,
+                        from_=from_time,
+                        to=now,
+                        interval=SubscriptionInterval.SUBSCRIPTION_INTERVAL_ONE_MINUTE,
+                    )
+
+                    if not response.candles:
+                        print(f"[SANDBOX REAL] {ticker}: свечей за 5 мин нет")
+                        continue
+
+                    for candle in response.candles:
+                        open_price = candle.open.units + (candle.open.nano / 1e9)
+                        close_price = candle.close.units + (candle.close.nano / 1e9)
+                        timestamp = int(candle.time.timestamp())
+
+                        redis_key = f"candles:live:{ticker}"
+                        candle_data = json.dumps({
+                            "time": candle.time.isoformat(),
+                            "open": open_price,
+                            "close": close_price,
+                            "volume": candle.volume,
+                        })
+                        await redis_writer.zadd(redis_key, {candle_data: timestamp})
+
+                    cutoff = int(now.timestamp()) - 259200
+                    await redis_writer.zremrangebyscore(redis_key, "-inf", cutoff)
+
+                    if ticker not in ready_tickers:
+                        ready_tickers.add(ticker)
+                        await redis_writer.set(f"streamer:ready:{ticker}", "1", ex=READY_FLAG_TTL)
+                        await redis_writer.lpush("streamer:ready_queue", ticker)
+                        print(f"[SANDBOX REAL] ✅ Тикер {ticker} готов ({len(response.candles)} свечей)")
+                    else:
+                        print(f"[SANDBOX REAL] {ticker}: обновлено {len(response.candles)} свечей")
+
+                except Exception as e:
+                    print(f"[SANDBOX REAL] Ошибка для {ticker}: {type(e).__name__}: {e}")
+
+            await asyncio.sleep(SANDBOX_POLL_INTERVAL)
+
+    except asyncio.CancelledError:
+        print("[SANDBOX REAL] Остановлен.")
+    finally:
+        await redis_writer.aclose()
+
+
 async def handle_grpc_stream(client):
     """
-    Реальный gRPC-стрим от T-Invest API.
-    Работает только на боевом токене — в песочнице MarketDataStream недоступен.
+    РЕЖИМ production.
+    Реальный MarketDataStream от T-Invest. Публикует сигнал готовности
+    после первой свечи по каждому тикеру.
     """
     redis_writer = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    ready_tickers = set()
 
     async def request_iterator():
         if active_tickers:
@@ -265,6 +368,12 @@ async def handle_grpc_stream(client):
                 await redis_writer.zadd(redis_key, {candle_data: timestamp})
                 await redis_writer.zremrangebyscore(redis_key, "-inf", timestamp - 259200)
 
+                if ticker not in ready_tickers:
+                    ready_tickers.add(ticker)
+                    await redis_writer.set(f"streamer:ready:{ticker}", "1", ex=READY_FLAG_TTL)
+                    await redis_writer.lpush("streamer:ready_queue", ticker)
+                    print(f"[gRPC] ✅ Тикер {ticker} готов (сигнал отправлен)")
+
                 async with db_manager.pool.acquire() as conn:
                     await conn.execute(
                         """
@@ -283,29 +392,39 @@ async def handle_grpc_stream(client):
 
 
 async def main():
-    if not TINKOFF_TOKEN or TINKOFF_TOKEN.startswith("t.mock"):
-        print("[STARTUP] Критическая ошибка: в .env не указан TINKOFF_TOKEN.")
-        return
+    # Проверка токена — нужна для всех режимов, кроме чистой симуляции
+    if STREAM_MODE != "sandbox_simulation":
+        if not TINKOFF_TOKEN or TINKOFF_TOKEN.startswith("t.mock"):
+            print("[STARTUP] Критическая ошибка: в .env не указан TINKOFF_TOKEN.")
+            return
 
-    CLEAN_TOKEN = TINKOFF_TOKEN.strip().replace('"', '').replace("'", "")
+    CLEAN_TOKEN = (TINKOFF_TOKEN or "").strip().replace('"', '').replace("'", "")
 
-    mode = "ПЕСОЧНИЦА (симуляция)" if USE_SANDBOX else "БОЕВОЙ (реальный стрим)"
-    print(f"[STARTUP] Режим: {mode}")
+    print(f"[STARTUP] Фактический режим: {STREAM_MODE}")
 
     await db_manager.connect()
 
     while True:
         try:
-            if USE_SANDBOX:
-                # --- РЕЖИМ ПЕСОЧНИЦЫ: симуляция свечей ---
+            # --- РЕЖИМ 1: СИМУЛЯЦИЯ (без T-Invest) ---
+            if STREAM_MODE == "sandbox_simulation":
                 redis_task = asyncio.create_task(listen_redis_channels())
                 sim_task = asyncio.create_task(simulate_candles())
                 await asyncio.gather(redis_task, sim_task)
 
-            else:
-                # --- БОЕВОЙ РЕЖИМ: реальный MarketDataStream ---
+            # --- РЕЖИМ 2: SANDBOX + GetCandles ---
+            elif STREAM_MODE == "sandbox_real":
+                async with AsyncClient(CLEAN_TOKEN, target=INVEST_GRPC_API_SANDBOX) as client:
+                    await sync_instruments(client)
+
+                    redis_task = asyncio.create_task(listen_redis_channels())
+                    poll_task = asyncio.create_task(poll_real_candles_sandbox(client))
+
+                    await asyncio.gather(redis_task, poll_task)
+
+            # --- РЕЖИМ 3: PRODUCTION ---
+            else:  # STREAM_MODE == "production"
                 async with AsyncClient(CLEAN_TOKEN) as client:
-                    # ✅ ВАЛИДАЦИЯ: убеждаемся, что мы действительно на боевом контуре
                     if not await validate_production_connection(client):
                         print("[STARTUP] Отказ от запуска: боевой контур не подтверждён.")
                         return

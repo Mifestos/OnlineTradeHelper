@@ -27,7 +27,7 @@ from src.database.connection import db_manager
 from src.services.analytics.worker import celery_app
 from src.settings import REDIS_HOST, REDIS_PORT
 
-current_global_subscriptions = {"SBER", "YDEX", "LKOH"}
+current_global_subscriptions = set()
 
 class OptimizationRequest(BaseModel):
     selected_tickers: List[str]

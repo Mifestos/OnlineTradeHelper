@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import ssl
+import time
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
@@ -26,6 +27,12 @@ celery_app = Celery(
     backend=f"redis://{REDIS_HOST}:{REDIS_PORT}/0"
 )
 
+# Таймаут ожидания готовности streamer'а (в секундах).
+# Должен быть с запасом перекрывать интервал первой свечи streamer'а:
+#   - симуляция: 5 сек
+#   - боевой стрим: ~60 сек
+READY_WAIT_TIMEOUT = float(os.getenv("READY_WAIT_TIMEOUT", "90.0"))
+
 
 def get_actual_cbr_key_rate() -> float:
     """
@@ -33,12 +40,9 @@ def get_actual_cbr_key_rate() -> float:
     Метод KeyRateXML требует обязательные параметры fromDate и ToDate.
     В ответе ЦБ дата лежит в теге <DT>, ставка — в <Rate>.
     Записи сортируются по дате — берётся самая свежая.
-    Возвращает долю (например, 0.14 для 14%).
-    При ошибке — откат на дефолтное значение 14%.
     """
     url = "https://www.cbr.ru/DailyInfoWebServ/DailyInfo.asmx"
 
-    # ЦБ требует даты в формате ISO 8601 (YYYY-MM-DD)
     date_to = datetime.now().strftime("%Y-%m-%d")
     date_from = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
 
@@ -64,7 +68,6 @@ def get_actual_cbr_key_rate() -> float:
         },
     )
 
-    # Обход проверки SSL (актуально для инфраструктуры Минцифры в РФ)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -74,8 +77,6 @@ def get_actual_cbr_key_rate() -> float:
             xml_data = response.read()
             root = ET.fromstring(xml_data)
 
-            # Собираем все пары (дата, ставка) из элементов <KR>.
-            # В ответе ЦБ дата лежит в теге <DT>, ставка — в <Rate>.
             kr_entries = []
             for elem in root.iter():
                 if elem.tag.split("}")[-1] == "KR":
@@ -93,8 +94,6 @@ def get_actual_cbr_key_rate() -> float:
             if not kr_entries:
                 raise ValueError("В ответе ЦБ не найдено ни одной записи с датой и ставкой")
 
-            # Сортируем по дате (ISO-формат YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS
-            # сортируется лексикографически корректно)
             kr_entries.sort(key=lambda x: x[0])
             latest_date, latest_rate_str = kr_entries[-1]
 
@@ -106,6 +105,49 @@ def get_actual_cbr_key_rate() -> float:
     except Exception as e:
         print(f"[CBR API] Не удалось загрузить ставку ЦБ ({e}). Откат на дефолтные 14%.")
     return 0.14
+
+
+def wait_for_live_data(tickers: list, timeout: float = READY_WAIT_TIMEOUT) -> bool:
+    """
+    Инженерное ожидание готовности streamer'а через Redis-флаги.
+
+    Логика:
+    1. Быстрая проверка — если флаг `streamer:ready:{ticker}` уже стоит,
+       тикер готов, ждать не нужно.
+    2. Если флага нет — worker блокирующе ждёт сигнала через BLPOP
+       из очереди `streamer:ready_queue` с общим таймаутом.
+
+    Возвращает True, если все тикеры готовы, False при таймауте.
+    """
+    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    start = time.time()
+
+    # Шаг 1: быстрая проверка — кто уже готов
+    missing = {t for t in tickers if not r.exists(f"streamer:ready:{t}")}
+
+    if not missing:
+        print(f"[REDIS WAIT] ✅ Все тикеры уже готовы (флаги стояли)")
+        return True
+
+    print(f"[REDIS WAIT] Ожидание готовности: {missing} (таймаут {timeout}с)...")
+
+    # Шаг 2: блокирующее ожидание сигналов через BLPOP
+    while missing and (time.time() - start) < timeout:
+        remaining_timeout = max(1, int(timeout - (time.time() - start)))
+        # BLPOP блокирует до появления элемента или таймаута
+        result = r.blpop("streamer:ready_queue", timeout=remaining_timeout)
+        if result:
+            _, ticker = result
+            print(f"[REDIS WAIT] 📩 Получен сигнал готовности: {ticker}")
+            missing.discard(ticker)
+
+    if not missing:
+        elapsed = time.time() - start
+        print(f"[REDIS WAIT] ✅ Все тикеры готовы за {elapsed:.2f}с")
+        return True
+
+    print(f"[REDIS WAIT] ⏱ Таймаут {timeout}с. Не дождались: {missing}")
+    return False
 
 
 def load_history_from_timescaledb(tickers: list) -> pd.DataFrame:
@@ -127,10 +169,8 @@ def load_history_from_timescaledb(tickers: list) -> pd.DataFrame:
             print("[DB READ] Предупреждение: База данных вернула 0 записей.")
             return pd.DataFrame()
 
-        # Принудительно очищаем таймзону для совместимости с Prophet и генераторами
         df_raw["time"] = pd.to_datetime(df_raw["time"]).dt.tz_localize(None)
 
-        # Пересобираем таблицу: строки - время, колонки - тикеры, значения - цены Close
         df_pivot = df_raw.pivot(index="time", columns="ticker", values="close")
         print(f"[DB READ] Успешно загружено {len(df_pivot)} исторических дней.")
         return df_pivot
@@ -158,6 +198,8 @@ def load_live_data_from_redis(tickers: list) -> pd.DataFrame:
         if closes:
             combined_data[ticker] = pd.Series(closes, index=times)
             print(f"[REDIS READ] Извлечено {len(closes)} живых свечей для {ticker}")
+        else:
+            print(f"[REDIS READ] Для {ticker} live-свечей не найдено")
 
     if not combined_data:
         return pd.DataFrame()
@@ -195,10 +237,13 @@ def compute_portfolio_optimization(
             ).tz_localize(None),
         )
 
-    # 2. Подтягиваем «живой хвост» реалтайм-данных из Redis
+    # 2. Ждём сигнал готовности streamer'а через Redis-флаги и BLPOP
+    wait_for_live_data(selected_tickers)
+
+    # 3. Подтягиваем «живой хвост» реалтайм-данных из Redis
     live_history = load_live_data_from_redis(selected_tickers)
 
-    # 3. Склеиваем историю с живыми данными
+    # 4. Склеиваем историю с живыми данными
     if not live_history.empty:
         live_daily = live_history.resample("D").last().ffill()
         full_history = pd.concat([base_history, live_daily])
@@ -209,7 +254,7 @@ def compute_portfolio_optimization(
         full_history = base_history
         print("[CELERY WORKER] Данных в Redis не обнаружено, расчет по исторической базе данных.")
 
-    # 4. Рассчитываем реальные доходности и ковариацию на основе склеенных данных
+    # 5. Рассчитываем реальные доходности и ковариацию на основе склеенных данных
     returns_df = full_history.pct_change(fill_method=None).dropna()
     expected_returns = returns_df.mean() * 252
     cov_matrix = returns_df.cov() * 252
@@ -221,21 +266,19 @@ def compute_portfolio_optimization(
             columns=selected_tickers,
         )
 
-    # 5. Обучение ИИ-модели Prophet
+    # 6. Обучение ИИ-модели Prophet
     model = ModelFactory.get_model(model_name)
     print(f"[CELERY WORKER] Запуск обучения модели {model_name}...")
     forecasted_prices = model.fit_forecast(full_history, days_to_forecast)
 
-    # 6. Оптимизация портфеля Марковица / Шарпа
+    # 7. Оптимизация портфеля Марковица / Шарпа
     min_bounds = [0.0] * num_assets
     max_bounds = [max_asset_weight] * num_assets
 
-    # --- КРИТИЧЕСКИЙ ЛОГ ДЛЯ ДИАГНОСТИКИ ---
     print(f"[MATHEMATICS DASHBOARD] Количество активов: {num_assets}")
     print(f"[MATHEMATICS DASHBOARD] Переданные тикеры: {selected_tickers}")
     print(f"[MATHEMATICS DASHBOARD] Сформированные min_bounds: {min_bounds}")
     print(f"[MATHEMATICS DASHBOARD] Сформированные max_bounds: {max_bounds}")
-    # ----------------------------------------
 
     # Автоматически подтягиваем реальную ключевую ставку с API Центробанка
     current_risk_free_rate = get_actual_cbr_key_rate()
