@@ -26,7 +26,22 @@ async function loadProfiles() {
             
             const maxWeight = (profile.parameters.max_asset_weight * 100).toFixed(0);
             
+            // Кнопка удаления — только для кастомных профилей
+            const deleteButton = profile.is_custom 
+                ? `<button onclick="event.stopPropagation(); deleteCustomProfile('${profile.name}', '${profile.display_name}')" 
+                    style="position: absolute; top: 8px; right: 8px; width: 32px; height: 32px;
+                        background: #fee2e2; border: 1px solid #fca5a5;
+                        color: #dc2626; font-size: 20px; font-weight: 900;
+                        cursor: pointer; line-height: 1; display: flex;
+                        align-items: center; justify-content: center;
+                        border-radius: 6px; transition: all 0.15s; padding: 0;"
+                    onmouseover="this.style.background='#fecaca';"
+                    onmouseout="this.style.background='#fee2e2';"
+                    title="Удалить профиль">✕</button>` 
+                : '';
+            
             card.innerHTML = `
+                ${deleteButton}
                 <div class="title">${profile.display_name}</div>
                 <div class="desc">${profile.description}</div>
                 <div class="params">Модель: ${profile.parameters.model_name} | Макс. доля: ${maxWeight}%</div>
@@ -71,12 +86,16 @@ function selectProfile(profileName) {
 
 function toggleManual() {
     const section = document.getElementById("manualSection");
+    const saveBox = document.getElementById("saveProfileBox");
     section.classList.toggle("open");
     
     if (section.classList.contains("open")) {
         selectedProfile = null;
         document.querySelectorAll(".profile-card").forEach(card => card.classList.remove("selected"));
+        if (saveBox) saveBox.style.display = "block";
         console.log("[UI] Ручной режим");
+    } else {
+        if (saveBox) saveBox.style.display = "none";
     }
 }
 
@@ -106,6 +125,99 @@ async function loadModels() {
     } catch (error) {
         console.error("[UI] Ошибка загрузки моделей:", error);
         select.innerHTML = '<option value="prophet">Prophet (fallback)</option>';
+    }
+}
+
+
+// ============================================================================
+// Сохранение кастомного профиля
+// ============================================================================
+
+async function saveCustomProfile() {
+    const nameInput = document.getElementById("profileName");
+    const descInput = document.getElementById("profileDescription");
+    
+    const name = nameInput.value.trim();
+    const description = descInput ? descInput.value.trim() : "";
+    
+    if (!name || name.length < 2) {
+        alert("Введите название профиля (минимум 2 символа)");
+        return;
+    }
+    
+    // Генерируем латинский profile_name из display_name
+    const profileName = name.toLowerCase()
+        .replace(/[^a-zа-я0-9\s]/g, "")
+        .replace(/\s+/g, "_")
+        .trim();
+    
+    if (!profileName) {
+        alert("Название должно содержать буквы или цифры");
+        return;
+    }
+    
+    const rawWeight = parseFloat(document.getElementById("maxAssetWeight").value);
+    
+    const payload = {
+        name: profileName,
+        display_name: name,
+        description: description,
+        model_name: document.getElementById("modelName").value,
+        optimisation_strategy: document.getElementById("strategyName").value,
+        max_asset_weight: rawWeight / 100.0,
+        risk_aversion: parseFloat(document.getElementById("riskAversion").value),
+        days_to_forecast: 30,
+    };
+    
+    try {
+        const response = await fetch(`${API_BASE}/profiles/save`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+        
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || "Ошибка сохранения");
+        }
+        
+        alert(`✅ Профиль "${name}" сохранён!`);
+        
+        nameInput.value = "";
+        if (descInput) descInput.value = "";
+        
+        await loadProfiles();
+    } catch (error) {
+        alert("Ошибка: " + error.message);
+    }
+}
+
+
+// ============================================================================
+// Удаление кастомного профиля
+// ============================================================================
+
+async function deleteCustomProfile(profileName, displayName) {
+    const label = displayName || profileName;
+    
+    if (!confirm(`Удалить профиль "${label}"?`)) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`${API_BASE}/profiles/${profileName}`, {
+            method: "DELETE"
+        });
+        
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || "Ошибка удаления");
+        }
+        
+        console.log(`[UI] Профиль "${profileName}" удалён`);
+        await loadProfiles();
+    } catch (error) {
+        alert("Ошибка: " + error.message);
     }
 }
 
@@ -206,7 +318,7 @@ function pollTaskStatus(taskId) {
 
 
 // ============================================================================
-// Отображение результатов (с предупреждением о fallback и строкой "Наличные")
+// Отображение результатов
 // ============================================================================
 
 function displayResults(weights, meta = {}) {
@@ -259,7 +371,7 @@ function displayResults(weights, meta = {}) {
         resultsBody.innerHTML += row;
     }
     
-    // === СТРОКА "НАЛИЧНЫЕ" (если остаток > 0.01%) ===
+    // === СТРОКА "НАЛИЧНЫЕ" ===
     const cashWeight = meta.cash_weight || 0;
     if (cashWeight > 0.0001) {
         const cashPercentage = (cashWeight * 100).toFixed(2);
@@ -271,6 +383,91 @@ function displayResults(weights, meta = {}) {
     }
     
     resultsBox.style.display = "block";
+}
+
+
+// ============================================================================
+// История оптимизаций
+// ============================================================================
+
+function toggleHistory() {
+    const section = document.getElementById("historySection");
+    const arrow = document.getElementById("historyArrow");
+    
+    if (section.style.display === "none") {
+        section.style.display = "block";
+        arrow.textContent = "▾";
+        loadHistory();
+    } else {
+        section.style.display = "none";
+        arrow.textContent = "▸";
+    }
+}
+
+
+async function loadHistory() {
+    const content = document.getElementById("historyContent");
+    content.innerHTML = '<div style="text-align: center; color: #94a3b8; padding: 20px;">⏳ Загрузка...</div>';
+    
+    try {
+        const response = await fetch(`${API_BASE}/history?limit=20`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        
+        const data = await response.json();
+        
+        if (!data.history || data.history.length === 0) {
+            content.innerHTML = '<div style="text-align: center; color: #94a3b8; padding: 20px;">История пуста. Запустите оптимизацию — и она появится здесь.</div>';
+            return;
+        }
+        
+        let html = '<table style="width: 100%; border-collapse: collapse; font-size: 13px;">';
+        html += `
+            <thead>
+                <tr style="border-bottom: 2px solid #e2e8f0;">
+                    <th style="padding: 8px; text-align: left;">Время</th>
+                    <th style="padding: 8px; text-align: left;">Модель</th>
+                    <th style="padding: 8px; text-align: left;">Портфель</th>
+                    <th style="padding: 8px; text-align: left;">Статус</th>
+                </tr>
+            </thead>
+            <tbody>
+        `;
+        
+        data.history.forEach(run => {
+            const date = new Date(run.run_at).toLocaleString("ru-RU", {
+                day: "2-digit", month: "2-digit", year: "2-digit",
+                hour: "2-digit", minute: "2-digit"
+            });
+            
+            const weightsStr = Object.entries(run.weights)
+                .map(([ticker, w]) => `${ticker} ${(w * 100).toFixed(0)}%`)
+                .join(", ");
+            
+            const cashStr = run.cash_weight > 0.001 
+                ? `, 💵 ${(run.cash_weight * 100).toFixed(0)}%` 
+                : "";
+            
+            const statusIcon = run.fallback_used ? "⚠️" : "✅";
+            const statusText = run.fallback_used ? "fallback" : "оптимум";
+            
+            html += `
+                <tr style="border-bottom: 1px solid #f1f5f9;">
+                    <td style="padding: 8px; color: #64748b; white-space: nowrap;">${date}</td>
+                    <td style="padding: 8px; color: #475569;">${run.model_name}</td>
+                    <td style="padding: 8px; color: #111;">${weightsStr}${cashStr}</td>
+                    <td style="padding: 8px;">${statusIcon} ${statusText}</td>
+                </tr>
+            `;
+        });
+        
+        html += '</tbody></table>';
+        content.innerHTML = html;
+        
+        console.log(`[UI] Загружено ${data.history.length} записей истории`);
+    } catch (error) {
+        console.error("[UI] Ошибка загрузки истории:", error);
+        content.innerHTML = `<div style="text-align: center; color: #dc2626; padding: 20px;">Ошибка: ${error.message}</div>`;
+    }
 }
 
 

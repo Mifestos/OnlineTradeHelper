@@ -15,6 +15,7 @@
         /* === Профили === */
         .profiles-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
         .profile-card {
+            position: relative;
             display: flex; flex-direction: column; gap: 6px;
             padding: 16px 20px; border: 2px solid #e2e8f0; border-radius: 10px;
             cursor: pointer; transition: all 0.15s; background: #fff;
@@ -44,6 +45,14 @@
         .results-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         .results-table th, .results-table td { padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: left; }
         .results-table th { font-weight: 600; color: #444; }
+
+        /* === История === */
+        .history-title {
+            cursor: pointer; user-select: none;
+            display: flex; align-items: center; justify-content: space-between;
+        }
+        .history-title:hover { color: #2563eb; }
+        #historyArrow { font-size: 18px; color: #94a3b8; transition: transform 0.15s; }
     </style>
 </head>
 <body>
@@ -100,6 +109,22 @@
         </div>
     </div>
 
+    <!-- === Блок сохранения кастомного профиля === -->
+    <div id="saveProfileBox" style="display: none; margin-top: 16px; padding: 16px; background: #eff6ff; border: 1px solid #93c5fd; border-radius: 8px;">
+        <div style="font-weight: 600; color: #1e40af; margin-bottom: 12px;">💾 Сохранить текущие настройки как профиль</div>
+
+        <input type="text" id="profileName" placeholder="Название (например, 'Мой агрессивный')"
+               style="width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; margin-bottom: 8px; box-sizing: border-box;">
+
+        <input type="text" id="profileDescription" placeholder="Описание (необязательно)"
+               style="width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; margin-bottom: 12px; box-sizing: border-box;">
+
+        <button onclick="saveCustomProfile()"
+                style="width: 100%; padding: 10px; background: #2563eb; color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer;">
+            Сохранить профиль
+        </button>
+    </div>
+
     <button id="calculateBtn" class="run-btn" onclick="startOptimization()">Запустить ИИ-оптимизацию</button>
 
     <div id="loader" class="loader">ИИ-воркер Celery обучается и рассчитывает веса... Подождите...</div>
@@ -116,9 +141,28 @@
             <tbody id="resultsBody"></tbody>
         </table>
     </div>
+
+    <!-- === История оптимизаций === -->
+    <div class="section" style="margin-top: 30px; border-top: 2px solid #f0f2f5; padding-top: 20px;">
+        <span class="section-title history-title" onclick="toggleHistory()">
+            <span>📜 История оптимизаций</span>
+            <span id="historyArrow">▸</span>
+        </span>
+        <div id="historySection" style="display: none; margin-top: 12px;">
+            <button onclick="loadHistory()"
+                    style="width: auto; padding: 8px 16px; margin-bottom: 12px; background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; border-radius: 6px; cursor: pointer; font-size: 14px;">
+                🔄 Обновить
+            </button>
+            <div id="historyContent">
+                <div style="text-align: center; color: #94a3b8; padding: 20px;">
+                    Нажмите «Обновить» для загрузки истории
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 
-<script src="app.js?v=1.0.3"></script>
+<script src="app.js?v=1.0.5"></script>
 
 </body>
 </html>

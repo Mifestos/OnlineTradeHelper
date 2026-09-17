@@ -2,6 +2,7 @@
 import os
 import sys
 import ssl
+import json
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
@@ -124,6 +125,52 @@ def load_history_from_timescaledb(tickers: list) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def save_optimization_run(
+    profile_name,
+    model_name,
+    optimisation_strategy,
+    tickers,
+    weights,
+    cash_weight,
+    risk_free_rate,
+    max_asset_weight,
+    risk_aversion,
+    fallback_used,
+    optimiser_success,
+):
+    """Сохраняет результат оптимизации в историю."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO optimization_runs
+                (profile_name, model_name, optimisation_strategy, tickers, weights,
+                 cash_weight, risk_free_rate, max_asset_weight, risk_aversion,
+                 fallback_used, optimiser_success)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            profile_name,
+            model_name,
+            optimisation_strategy,
+            tickers,
+            json.dumps(weights),
+            cash_weight,
+            risk_free_rate,
+            max_asset_weight,
+            risk_aversion,
+            fallback_used,
+            optimiser_success,
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"[HISTORY] ✅ Запуск сохранён в историю")
+        return True
+    except Exception as e:
+        print(f"[HISTORY] ❌ Ошибка сохранения: {e}")
+        return False
+
+
 @celery_app.task(name="tasks.compute_portfolio_optimization")
 def compute_portfolio_optimization(
     selected_tickers: list,
@@ -132,6 +179,7 @@ def compute_portfolio_optimization(
     risk_aversion: float,
     days_to_forecast: int,
     max_asset_weight: float = 1.0,
+    profile_name: str = None,
 ) -> dict:
     print(f"[CELERY WORKER] Входящий max_asset_weight: {max_asset_weight}")
     print(f"[CELERY WORKER] Начало выполнения задачи для тикеров: {selected_tickers}")
@@ -225,6 +273,21 @@ def compute_portfolio_optimization(
               f"В наличных: {cash_weight * 100:.2f}%")
     else:
         cash_weight = 0.0
+
+    # 7. Сохраняем в историю
+    save_optimization_run(
+        profile_name=profile_name,
+        model_name=model_name,
+        optimisation_strategy=optimisation_strategy,
+        tickers=selected_tickers,
+        weights=weights_dict,
+        cash_weight=cash_weight,
+        risk_free_rate=current_risk_free_rate,
+        max_asset_weight=max_asset_weight,
+        risk_aversion=risk_aversion,
+        fallback_used=optimiser_result["fallback_used"],
+        optimiser_success=optimiser_result["success"],
+    )
 
     print("[CELERY WORKER] Расчет успешно завершен.")
     return {

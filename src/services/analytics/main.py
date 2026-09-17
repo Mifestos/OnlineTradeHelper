@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from celery.result import AsyncResult
+import psycopg2
 
 app = FastAPI(title="OnlineTradeHelper AI Analytics Core")
 
@@ -26,22 +27,36 @@ if BASE_DIR not in sys.path:
 from src.database.connection import db_manager
 from src.services.analytics.worker import celery_app
 from src.services.analytics.models import ModelRegistry
-from src.services.analytics.profiles import list_profiles, resolve_profile_or_default
-from src.settings import REDIS_HOST, REDIS_PORT
+from src.services.analytics.profiles import (
+    list_profiles,
+    resolve_profile_or_default,
+    save_custom_profile,
+    delete_custom_profile,
+)
+from src.settings import REDIS_HOST, REDIS_PORT, DATABASE_URL
 
 current_global_subscriptions = set()
 
 
 class OptimizationRequest(BaseModel):
     selected_tickers: List[str]
-    # Профиль (опционально):
     profile_name: Optional[str] = None
-    # Ручные параметры (используются, если profile_name не задан):
     model_name: Optional[str] = None
     optimisation_strategy: Optional[str] = None
     risk_aversion: float = 3.0
     days_to_forecast: int = 30
     max_asset_weight: float = 1.0
+
+
+class SaveProfileRequest(BaseModel):
+    name: str
+    display_name: str
+    description: str = ""
+    model_name: str
+    optimisation_strategy: str
+    max_asset_weight: float
+    risk_aversion: float
+    days_to_forecast: int = 30
 
 
 @app.on_event("startup")
@@ -64,8 +79,110 @@ async def list_models():
 
 @app.get("/api/v1/profiles")
 async def list_risk_profiles():
-    """Список доступных профилей риска."""
+    """Список доступных профилей риска (дефолтные + кастомные)."""
     return {"profiles": list_profiles()}
+
+
+@app.post("/api/v1/profiles/save")
+async def save_profile_endpoint(request: SaveProfileRequest):
+    """Сохраняет кастомный профиль пользователя."""
+    if request.model_name not in ModelRegistry.list_names():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Модель '{request.model_name}' не найдена. "
+                   f"Доступные: {ModelRegistry.list_names()}"
+        )
+
+    if request.name in {"conservative", "balanced", "aggressive"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Имя '{request.name}' зарезервировано. Выберите другое."
+        )
+
+    success = save_custom_profile({
+        "name": request.name,
+        "display_name": request.display_name,
+        "description": request.description,
+        "model_name": request.model_name,
+        "optimisation_strategy": request.optimisation_strategy,
+        "max_asset_weight": request.max_asset_weight,
+        "risk_aversion": request.risk_aversion,
+        "days_to_forecast": request.days_to_forecast,
+    })
+
+    if not success:
+        raise HTTPException(status_code=500, detail="Не удалось сохранить профиль")
+
+    return {
+        "status": "success",
+        "message": f"Профиль '{request.display_name}' сохранён",
+    }
+
+
+@app.delete("/api/v1/profiles/{profile_name}")
+async def delete_profile_endpoint(profile_name: str):
+    """Удаляет кастомный профиль пользователя."""
+    if profile_name in {"conservative", "balanced", "aggressive"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Нельзя удалить дефолтный профиль",
+        )
+
+    success = delete_custom_profile(profile_name)
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Профиль '{profile_name}' не найден",
+        )
+
+    return {
+        "status": "success",
+        "message": f"Профиль '{profile_name}' удалён",
+    }
+
+
+@app.get("/api/v1/history")
+async def get_history(limit: int = 20):
+    """
+    Возвращает последние N запусков оптимизации.
+    """
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, run_at, profile_name, model_name, optimisation_strategy,
+                   tickers, weights, cash_weight, risk_free_rate,
+                   max_asset_weight, risk_aversion, fallback_used, optimiser_success
+            FROM optimization_runs
+            ORDER BY run_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        result = []
+        for row in rows:
+            result.append({
+                "id": row[0],
+                "run_at": row[1].isoformat() if row[1] else None,
+                "profile_name": row[2],
+                "model_name": row[3],
+                "optimisation_strategy": row[4],
+                "tickers": row[5],
+                "weights": row[6],
+                "cash_weight": row[7],
+                "risk_free_rate": row[8],
+                "max_asset_weight": row[9],
+                "risk_aversion": row[10],
+                "fallback_used": row[11],
+                "optimiser_success": row[12],
+            })
+
+        return {"history": result}
+    except Exception as e:
+        print(f"[HISTORY] Ошибка чтения: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка чтения истории: {e}")
 
 
 @app.post("/api/v1/optimize")
@@ -84,6 +201,7 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
         resolved_risk_aversion = profile["risk_aversion"]
         resolved_days = profile["days_to_forecast"]
         resolved_max_weight = profile["max_asset_weight"]
+        resolved_profile_name = request.profile_name
         print(f"[FASTAPI] Применён профиль: {profile['display_name']}")
     else:
         resolved_model = request.model_name
@@ -91,6 +209,7 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
         resolved_risk_aversion = request.risk_aversion
         resolved_days = request.days_to_forecast
         resolved_max_weight = request.max_asset_weight
+        resolved_profile_name = None
         print(f"[FASTAPI] Ручной режим: model={resolved_model}, strategy={resolved_strategy}")
 
     # Валидация модели
@@ -134,6 +253,7 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
             "risk_aversion": resolved_risk_aversion,
             "days_to_forecast": resolved_days,
             "max_asset_weight": resolved_max_weight,
+            "profile_name": resolved_profile_name,
         }
     )
 
@@ -141,7 +261,7 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
         "status": "pending",
         "message": "Задача оптимизации отправлена.",
         "task_id": task.id,
-        "applied_profile": profile["name"] if profile else None,
+        "applied_profile": resolved_profile_name,
     }
 
 
