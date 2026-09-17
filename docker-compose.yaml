@@ -84,6 +84,22 @@ services:
       - DB_HOST=trade_helper_timescaledb
       - REDIS_HOST=trade_helper_redis
 
+  celery_beat:
+    build: .
+    container_name: oth_beat
+    restart: always
+    command: celery -A src.services.analytics.worker.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=trade_helper_timescaledb
+      - REDIS_HOST=trade_helper_redis
+
   # --- ФРОНТЕНД ---
   frontend:
     image: python:3.12-slim

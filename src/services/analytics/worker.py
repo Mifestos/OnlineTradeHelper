@@ -10,6 +10,7 @@ import psycopg2  # Синхронный клиент для Celery
 import xml.etree.ElementTree as ET
 from urllib.request import Request, urlopen
 from celery import Celery
+from celery.schedules import crontab
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if BASE_DIR not in sys.path:
@@ -24,6 +25,17 @@ celery_app = Celery(
     broker=f"redis://{REDIS_HOST}:{REDIS_PORT}/0",
     backend=f"redis://{REDIS_HOST}:{REDIS_PORT}/0"
 )
+
+# ============================================================================
+# Celery Beat: расписание для проверки schedules
+# ============================================================================
+
+celery_app.conf.beat_schedule = {
+    "check-schedules-every-minute": {
+        "task": "tasks.check_and_run_schedules",
+        "schedule": crontab(minute="*"),
+    },
+}
 
 
 def get_actual_cbr_key_rate() -> float:
@@ -164,12 +176,89 @@ def save_optimization_run(
         conn.commit()
         cur.close()
         conn.close()
-        print(f"[HISTORY] ✅ Запуск сохранён в историю")
+        print(f"[HISTORY] Запуск сохранён в историю")
         return True
     except Exception as e:
-        print(f"[HISTORY] ❌ Ошибка сохранения: {e}")
+        print(f"[HISTORY] Ошибка сохранения: {e}")
         return False
 
+
+# ============================================================================
+# SCHEDULER: проверка расписаний
+# ============================================================================
+
+@celery_app.task(name="tasks.check_and_run_schedules")
+def check_and_run_schedules():
+    """
+    Проверяет расписания каждую минуту.
+    Если время пришло — запускает оптимизацию.
+    """
+    now = datetime.now()
+    current_hour = now.hour
+    current_minute = now.minute
+
+    print(f"[SCHEDULER] Проверка расписаний: {now.strftime('%H:%M')}")
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT id, profile_name, model_name, optimisation_strategy,
+                   tickers, risk_aversion, max_asset_weight,
+                   run_hour, run_minute, last_run_at
+            FROM schedules
+            WHERE is_active = TRUE
+              AND run_hour = %s
+              AND run_minute = %s
+              AND (last_run_at IS NULL OR last_run_at::date < NOW()::date)
+        """, (current_hour, current_minute))
+
+        schedules = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not schedules:
+            return {"status": "ok", "triggered": 0}
+
+        print(f"[SCHEDULER] Найдено расписаний: {len(schedules)}")
+
+        for sched in schedules:
+            (schedule_id, profile_name, model_name, strategy,
+             tickers, risk_aversion, max_asset_weight,
+             run_hour, run_minute, last_run_at) = sched
+
+            print(f"[SCHEDULER] Запуск #{schedule_id}: {model_name}/{strategy}")
+
+            compute_portfolio_optimization.apply_async(
+                kwargs={
+                    "selected_tickers": list(tickers),
+                    "model_name": model_name,
+                    "optimisation_strategy": strategy,
+                    "risk_aversion": risk_aversion,
+                    "days_to_forecast": 30,
+                    "max_asset_weight": max_asset_weight,
+                    "profile_name": profile_name,
+                }
+            )
+
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("UPDATE schedules SET last_run_at = NOW() WHERE id = %s", (schedule_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
+
+        return {"status": "ok", "triggered": len(schedules)}
+
+    except Exception as e:
+        print(f"[SCHEDULER] Ошибка: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+# ============================================================================
+# ОСНОВНАЯ ЗАДАЧА: оптимизация портфеля
+# ============================================================================
 
 @celery_app.task(name="tasks.compute_portfolio_optimization")
 def compute_portfolio_optimization(
@@ -269,7 +358,7 @@ def compute_portfolio_optimization(
     cash_weight = round(max(0.0, 1.0 - total_invested), 4)
 
     if cash_weight > 0.001:
-        print(f"[CELERY WORKER] ⚠️ Не все средства распределены. "
+        print(f"[CELERY WORKER] Не все средства распределены. "
               f"В наличных: {cash_weight * 100:.2f}%")
     else:
         cash_weight = 0.0

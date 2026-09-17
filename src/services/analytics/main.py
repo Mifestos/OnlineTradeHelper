@@ -38,6 +38,10 @@ from src.settings import REDIS_HOST, REDIS_PORT, DATABASE_URL
 current_global_subscriptions = set()
 
 
+# ============================================================================
+# Модели запросов
+# ============================================================================
+
 class OptimizationRequest(BaseModel):
     selected_tickers: List[str]
     profile_name: Optional[str] = None
@@ -59,6 +63,21 @@ class SaveProfileRequest(BaseModel):
     days_to_forecast: int = 30
 
 
+class ScheduleRequest(BaseModel):
+    profile_name: Optional[str] = None
+    model_name: str
+    optimisation_strategy: str
+    tickers: List[str]
+    risk_aversion: float
+    max_asset_weight: float
+    run_hour: int = 19
+    run_minute: int = 0
+
+
+# ============================================================================
+# Lifecycle
+# ============================================================================
+
 @app.on_event("startup")
 async def startup_event():
     await db_manager.init_tables()
@@ -71,15 +90,23 @@ async def shutdown_event():
     print("Соединения бэкенда безопасно закрыты")
 
 
+# ============================================================================
+# Модели
+# ============================================================================
+
 @app.get("/api/v1/models")
 async def list_models():
     """Список доступных моделей прогноза."""
     return {"models": ModelRegistry.list_available()}
 
 
+# ============================================================================
+# Профили
+# ============================================================================
+
 @app.get("/api/v1/profiles")
 async def list_risk_profiles():
-    """Список доступных профилей риска (дефолтные + кастомные)."""
+    """Список профилей риска (дефолтные + кастомные)."""
     return {"profiles": list_profiles()}
 
 
@@ -141,11 +168,13 @@ async def delete_profile_endpoint(profile_name: str):
     }
 
 
+# ============================================================================
+# История
+# ============================================================================
+
 @app.get("/api/v1/history")
 async def get_history(limit: int = 20):
-    """
-    Возвращает последние N запусков оптимизации.
-    """
+    """Последние N запусков оптимизации."""
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
@@ -184,6 +213,120 @@ async def get_history(limit: int = 20):
         print(f"[HISTORY] Ошибка чтения: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка чтения истории: {e}")
 
+
+# ============================================================================
+# Расписания
+# ============================================================================
+
+@app.get("/api/v1/schedules")
+async def list_schedules():
+    """Список расписаний."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, profile_name, model_name, optimisation_strategy,
+                   tickers, risk_aversion, max_asset_weight,
+                   run_hour, run_minute, is_active, created_at, last_run_at
+            FROM schedules
+            ORDER BY created_at DESC
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        result = []
+        for row in rows:
+            result.append({
+                "id": row[0],
+                "profile_name": row[1],
+                "model_name": row[2],
+                "optimisation_strategy": row[3],
+                "tickers": row[4],
+                "risk_aversion": row[5],
+                "max_asset_weight": row[6],
+                "run_hour": row[7],
+                "run_minute": row[8],
+                "is_active": row[9],
+                "created_at": row[10].isoformat() if row[10] else None,
+                "last_run_at": row[11].isoformat() if row[11] else None,
+            })
+
+        return {"schedules": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка чтения: {e}")
+
+
+@app.post("/api/v1/schedules")
+async def create_schedule(request: ScheduleRequest):
+    """Создаёт расписание."""
+    if request.model_name not in ModelRegistry.list_names():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Модель '{request.model_name}' не найдена. "
+                   f"Доступные: {ModelRegistry.list_names()}"
+        )
+
+    if not (0 <= request.run_hour <= 23):
+        raise HTTPException(status_code=400, detail="run_hour должен быть 0-23")
+
+    if not (0 <= request.run_minute <= 59):
+        raise HTTPException(status_code=400, detail="run_minute должен быть 0-59")
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO schedules
+                (profile_name, model_name, optimisation_strategy, tickers,
+                 risk_aversion, max_asset_weight, run_hour, run_minute)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            request.profile_name,
+            request.model_name,
+            request.optimisation_strategy,
+            request.tickers,
+            request.risk_aversion,
+            request.max_asset_weight,
+            request.run_hour,
+            request.run_minute,
+        ))
+        schedule_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"status": "success", "schedule_id": schedule_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка создания: {e}")
+
+
+@app.delete("/api/v1/schedules/{schedule_id}")
+async def delete_schedule(schedule_id: int):
+    """Удаляет расписание."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if deleted == 0:
+            raise HTTPException(status_code=404, detail="Расписание не найдено")
+
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка удаления: {e}")
+
+
+# ============================================================================
+# Оптимизация
+# ============================================================================
 
 @app.post("/api/v1/optimize")
 async def optimize_portfolio_endpoint(request: OptimizationRequest):
@@ -264,6 +407,10 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
         "applied_profile": resolved_profile_name,
     }
 
+
+# ============================================================================
+# Статус задачи
+# ============================================================================
 
 @app.get("/api/v1/tasks/{task_id}")
 async def get_task_status(task_id: str):
