@@ -12,7 +12,6 @@
         .checkbox-group { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
         .checkbox-item { display: flex; align-items: center; gap: 8px; background: #f8fafc; padding: 10px; border-radius: 6px; cursor: pointer; border: 1px solid #e2e8f0; }
 
-        /* === Профили === */
         .profiles-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
         .profile-card {
             position: relative;
@@ -26,7 +25,6 @@
         .profile-card .desc { font-size: 13px; color: #64748b; }
         .profile-card .params { font-size: 12px; color: #94a3b8; margin-top: 4px; }
 
-        /* === Свернутый блок ручных настроек === */
         .manual-toggle {
             display: inline-block; margin-top: 10px; padding: 10px 16px;
             background: #f1f5f9; border: 1px dashed #cbd5e1;
@@ -46,7 +44,6 @@
         .results-table th, .results-table td { padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: left; }
         .results-table th { font-weight: 600; color: #444; }
 
-        /* === Cooldown индикатор === */
         #cooldownIndicator {
             display: none;
             margin-top: 12px;
@@ -58,13 +55,30 @@
             color: #92400e;
         }
 
-        /* === История === */
-        .history-title {
+        .portfolio-title, .history-title {
             cursor: pointer; user-select: none;
             display: flex; align-items: center; justify-content: space-between;
         }
-        .history-title:hover { color: #2563eb; }
-        #historyArrow { font-size: 18px; color: #94a3b8; transition: transform 0.15s; }
+        .portfolio-title:hover, .history-title:hover { color: #2563eb; }
+        #portfolioArrow, #historyArrow { font-size: 18px; color: #94a3b8; }
+
+        .portfolio-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+        .portfolio-table th, .portfolio-table td { padding: 8px; border-bottom: 1px solid #f1f5f9; text-align: left; }
+        .portfolio-table th { font-weight: 600; color: #64748b; font-size: 12px; text-transform: uppercase; }
+
+        .portfolio-edit-row { display: grid; grid-template-columns: 1fr 1fr 1fr 40px; gap: 8px; margin-bottom: 8px; }
+        .portfolio-edit-row input { padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; font-size: 14px; width: 100%; }
+        .portfolio-edit-row .remove-btn { padding: 8px; background: #fee2e2; color: #dc2626; border: 1px solid #fca5a5; border-radius: 6px; cursor: pointer; font-weight: 700; font-size: 14px; }
+        .btn-secondary { padding: 8px 16px; background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; border-radius: 6px; cursor: pointer; font-size: 14px; width: auto; }
+        .btn-primary { padding: 8px 16px; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; width: auto; }
+
+        .exec-divider {
+            margin-top: 20px; padding-top: 20px; border-top: 1px dashed #cbd5e1;
+        }
+        .exec-label {
+            color: #64748b; font-size: 13px; font-weight: 600;
+            margin-bottom: 12px; display: block;
+        }
     </style>
 </head>
 <body>
@@ -83,7 +97,27 @@
         </div>
     </div>
 
-    <div class="section">
+    <div class="section" style="border-top: 2px solid #f0f2f5; padding-top: 20px;">
+        <span class="section-title portfolio-title" onclick="togglePortfolio()">
+            <span>💼 Мой текущий портфель</span>
+            <span id="portfolioArrow">▸</span>
+        </span>
+        <div id="portfolioSection" style="display: none; margin-top: 12px;">
+            <div id="portfolioView">
+                <div style="text-align: center; color: #94a3b8; padding: 20px;">Загрузка...</div>
+            </div>
+            <div id="portfolioEdit" style="display: none; margin-top: 12px;">
+                <div id="portfolioEditRows"></div>
+                <div style="display: flex; gap: 8px; margin-top: 12px;">
+                    <button class="btn-secondary" onclick="addPortfolioRow()">+ Добавить позицию</button>
+                    <button class="btn-primary" onclick="savePortfolio()">💾 Сохранить</button>
+                    <button class="btn-secondary" onclick="cancelPortfolioEdit()">Отмена</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="section" style="border-top: 2px solid #f0f2f5; padding-top: 20px;">
         <span class="section-title">2. Выберите риск-профиль:</span>
         <div class="profiles-grid" id="profilesGrid">
             <div class="profile-card" data-profile="loading">Загрузка профилей...</div>
@@ -119,25 +153,43 @@
             <span class="section-title">Максимальная доля одного актива: <span id="weightValue">40%</span></span>
             <input type="range" id="maxAssetWeight" min="10" max="100" step="5" value="40" oninput="document.getElementById('weightValue').innerText=this.value + '%'">
         </div>
+
+        <!-- === Execution-параметры === -->
+        <div class="exec-divider">
+            <span class="exec-label">⚙️ Параметры ребалансировки (execution)</span>
+        </div>
+
+        <div class="section">
+            <span class="section-title">⏱ Cooldown между оптимизациями: <span id="cooldownValue">24</span> ч</span>
+            <input type="range" id="cooldownHours" min="1" max="168" step="1" value="24"
+                   oninput="document.getElementById('cooldownValue').innerText=this.value">
+        </div>
+
+        <div class="section">
+            <span class="section-title">🚫 No-trade зона (не торгуем при отклонении &lt;): <span id="noTradeValue">5</span>%</span>
+            <input type="range" id="noTradeThreshold" min="1" max="20" step="1" value="5"
+                   oninput="document.getElementById('noTradeValue').innerText=this.value">
+        </div>
+
+        <div class="section">
+            <span class="section-title">🔄 Максимальный turnover: <span id="maxTurnoverValue">20</span>%</span>
+            <input type="range" id="maxTurnover" min="5" max="50" step="5" value="20"
+                   oninput="document.getElementById('maxTurnoverValue').innerText=this.value">
+        </div>
     </div>
 
-    <!-- === Блок сохранения кастомного профиля === -->
     <div id="saveProfileBox" style="display: none; margin-top: 16px; padding: 16px; background: #eff6ff; border: 1px solid #93c5fd; border-radius: 8px;">
         <div style="font-weight: 600; color: #1e40af; margin-bottom: 12px;">💾 Сохранить текущие настройки как профиль</div>
-
         <input type="text" id="profileName" placeholder="Название (например, 'Мой агрессивный')"
                style="width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; margin-bottom: 8px; box-sizing: border-box;">
-
         <input type="text" id="profileDescription" placeholder="Описание (необязательно)"
                style="width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; margin-bottom: 12px; box-sizing: border-box;">
-
         <button onclick="saveCustomProfile()"
                 style="width: 100%; padding: 10px; background: #2563eb; color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer;">
             Сохранить профиль
         </button>
     </div>
 
-    <!-- === Индикатор cooldown === -->
     <div id="cooldownIndicator"></div>
 
     <button id="calculateBtn" class="run-btn" onclick="startOptimization(false)">Запустить ИИ-оптимизацию</button>
@@ -157,7 +209,6 @@
         </table>
     </div>
 
-    <!-- === История оптимизаций === -->
     <div class="section" style="margin-top: 30px; border-top: 2px solid #f0f2f5; padding-top: 20px;">
         <span class="section-title history-title" onclick="toggleHistory()">
             <span>📜 История оптимизаций</span>
@@ -177,7 +228,7 @@
     </div>
 </div>
 
-<script src="app.js?v=1.1.0"></script>
+<script src="app.js?v=1.3.0"></script>
 
 </body>
 </html>

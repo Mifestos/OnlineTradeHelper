@@ -3,6 +3,9 @@
 Профили риска для OnlineTradeHelper.
 
 Дефолтные профили (в коде) + кастомные профили (в БД).
+Каждый профиль включает:
+  - Веса: model, strategy, max_asset_weight, risk_aversion
+  - Execution: cooldown_hours, no_trade_threshold, max_turnover
 """
 from typing import Optional
 import psycopg2
@@ -23,6 +26,10 @@ PROFILES = {
         "max_asset_weight": 0.20,
         "risk_aversion": 5.0,
         "days_to_forecast": 30,
+        # Execution
+        "cooldown_hours": 72,
+        "no_trade_threshold": 0.10,
+        "max_turnover": 0.10,
         "is_custom": False,
     },
     "balanced": {
@@ -34,6 +41,10 @@ PROFILES = {
         "max_asset_weight": 0.35,
         "risk_aversion": 3.0,
         "days_to_forecast": 30,
+        # Execution
+        "cooldown_hours": 24,
+        "no_trade_threshold": 0.05,
+        "max_turnover": 0.20,
         "is_custom": False,
     },
     "aggressive": {
@@ -45,8 +56,19 @@ PROFILES = {
         "max_asset_weight": 0.50,
         "risk_aversion": 1.5,
         "days_to_forecast": 30,
+        # Execution
+        "cooldown_hours": 12,
+        "no_trade_threshold": 0.03,
+        "max_turnover": 0.30,
         "is_custom": False,
     },
+}
+
+# Дефолты для кастомных профилей
+DEFAULT_EXECUTION = {
+    "cooldown_hours": 24,
+    "no_trade_threshold": 0.05,
+    "max_turnover": 0.20,
 }
 
 
@@ -55,7 +77,7 @@ PROFILES = {
 # ============================================================================
 
 def _ensure_user_profiles_table():
-    """Создаёт таблицу user_profiles, если её нет."""
+    """Создаёт таблицу user_profiles и добавляет execution-колонки."""
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute("""
@@ -69,8 +91,18 @@ def _ensure_user_profiles_table():
             max_asset_weight DOUBLE PRECISION NOT NULL,
             risk_aversion DOUBLE PRECISION NOT NULL,
             days_to_forecast INT NOT NULL DEFAULT 30,
+            cooldown_hours DOUBLE PRECISION DEFAULT 24,
+            no_trade_threshold DOUBLE PRECISION DEFAULT 0.05,
+            max_turnover DOUBLE PRECISION DEFAULT 0.20,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
+    """)
+    # Добавляем колонки, если таблица уже существовала без них
+    cur.execute("""
+        ALTER TABLE user_profiles 
+            ADD COLUMN IF NOT EXISTS cooldown_hours DOUBLE PRECISION DEFAULT 24,
+            ADD COLUMN IF NOT EXISTS no_trade_threshold DOUBLE PRECISION DEFAULT 0.05,
+            ADD COLUMN IF NOT EXISTS max_turnover DOUBLE PRECISION DEFAULT 0.20;
     """)
     conn.commit()
     cur.close()
@@ -86,7 +118,8 @@ def load_custom_profiles() -> list:
         cur.execute("""
             SELECT profile_name, display_name, description,
                    model_name, optimisation_strategy,
-                   max_asset_weight, risk_aversion, days_to_forecast
+                   max_asset_weight, risk_aversion, days_to_forecast,
+                   cooldown_hours, no_trade_threshold, max_turnover
             FROM user_profiles
             ORDER BY created_at ASC
         """)
@@ -105,6 +138,9 @@ def load_custom_profiles() -> list:
                 "max_asset_weight": row[5],
                 "risk_aversion": row[6],
                 "days_to_forecast": row[7],
+                "cooldown_hours": row[8] if row[8] is not None else DEFAULT_EXECUTION["cooldown_hours"],
+                "no_trade_threshold": row[9] if row[9] is not None else DEFAULT_EXECUTION["no_trade_threshold"],
+                "max_turnover": row[10] if row[10] is not None else DEFAULT_EXECUTION["max_turnover"],
                 "is_custom": True,
             })
         return result
@@ -122,8 +158,9 @@ def save_custom_profile(profile: dict) -> bool:
         cur.execute("""
             INSERT INTO user_profiles
                 (profile_name, display_name, description, model_name,
-                 optimisation_strategy, max_asset_weight, risk_aversion, days_to_forecast)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 optimisation_strategy, max_asset_weight, risk_aversion, days_to_forecast,
+                 cooldown_hours, no_trade_threshold, max_turnover)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (profile_name) DO UPDATE SET
                 display_name = EXCLUDED.display_name,
                 description = EXCLUDED.description,
@@ -131,7 +168,10 @@ def save_custom_profile(profile: dict) -> bool:
                 optimisation_strategy = EXCLUDED.optimisation_strategy,
                 max_asset_weight = EXCLUDED.max_asset_weight,
                 risk_aversion = EXCLUDED.risk_aversion,
-                days_to_forecast = EXCLUDED.days_to_forecast
+                days_to_forecast = EXCLUDED.days_to_forecast,
+                cooldown_hours = EXCLUDED.cooldown_hours,
+                no_trade_threshold = EXCLUDED.no_trade_threshold,
+                max_turnover = EXCLUDED.max_turnover
         """, (
             profile["name"],
             profile["display_name"],
@@ -141,6 +181,9 @@ def save_custom_profile(profile: dict) -> bool:
             profile["max_asset_weight"],
             profile["risk_aversion"],
             profile.get("days_to_forecast", 30),
+            profile.get("cooldown_hours", DEFAULT_EXECUTION["cooldown_hours"]),
+            profile.get("no_trade_threshold", DEFAULT_EXECUTION["no_trade_threshold"]),
+            profile.get("max_turnover", DEFAULT_EXECUTION["max_turnover"]),
         ))
         conn.commit()
         cur.close()
@@ -202,6 +245,9 @@ def list_profiles() -> list:
                 "max_asset_weight": profile["max_asset_weight"],
                 "risk_aversion": profile["risk_aversion"],
                 "days_to_forecast": profile["days_to_forecast"],
+                "cooldown_hours": profile["cooldown_hours"],
+                "no_trade_threshold": profile["no_trade_threshold"],
+                "max_turnover": profile["max_turnover"],
             },
         })
 
@@ -217,6 +263,9 @@ def list_profiles() -> list:
                 "max_asset_weight": profile["max_asset_weight"],
                 "risk_aversion": profile["risk_aversion"],
                 "days_to_forecast": profile["days_to_forecast"],
+                "cooldown_hours": profile["cooldown_hours"],
+                "no_trade_threshold": profile["no_trade_threshold"],
+                "max_turnover": profile["max_turnover"],
             },
         })
 

@@ -94,3 +94,15 @@ CREATE TABLE IF NOT EXISTS ui_optimization_log (
 
 CREATE INDEX IF NOT EXISTS idx_ui_opt_log_user_time 
     ON ui_optimization_log (user_id, triggered_at DESC);
+
+-- ============================================================================
+-- Текущий портфель пользователя (для расчёта turnover)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS current_portfolios (
+    id SERIAL PRIMARY KEY,
+    user_id INT NOT NULL UNIQUE DEFAULT 1,
+    positions JSONB NOT NULL DEFAULT '{}'::jsonb,
+    avg_prices JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);

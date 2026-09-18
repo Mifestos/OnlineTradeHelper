@@ -38,7 +38,6 @@ from src.settings import REDIS_HOST, REDIS_PORT, DATABASE_URL
 
 current_global_subscriptions = set()
 
-# Cooldown между оптимизациями через UI
 UI_COOLDOWN_HOURS = float(os.getenv("UI_COOLDOWN_HOURS", "24"))
 
 
@@ -55,6 +54,10 @@ class OptimizationRequest(BaseModel):
     days_to_forecast: int = 30
     max_asset_weight: float = 1.0
     force: bool = False
+    # Execution-параметры (для ручного режима):
+    cooldown_hours: Optional[float] = None
+    no_trade_threshold: Optional[float] = None
+    max_turnover: Optional[float] = None
 
 
 class SaveProfileRequest(BaseModel):
@@ -66,6 +69,10 @@ class SaveProfileRequest(BaseModel):
     max_asset_weight: float
     risk_aversion: float
     days_to_forecast: int = 30
+    # Execution-параметры:
+    cooldown_hours: Optional[float] = None
+    no_trade_threshold: Optional[float] = None
+    max_turnover: Optional[float] = None
 
 
 class ScheduleRequest(BaseModel):
@@ -77,6 +84,11 @@ class ScheduleRequest(BaseModel):
     max_asset_weight: float
     run_hour: int = 19
     run_minute: int = 0
+
+
+class PortfolioRequest(BaseModel):
+    positions: dict
+    avg_prices: dict = {}
 
 
 # ============================================================================
@@ -172,6 +184,74 @@ async def get_cooldown_status():
 
 
 # ============================================================================
+# Portfolio (текущие позиции)
+# ============================================================================
+
+@app.get("/api/v1/portfolio")
+async def get_portfolio():
+    """Возвращает текущий портфель пользователя."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT positions, avg_prices, updated_at
+            FROM current_portfolios
+            WHERE user_id = 1
+        """)
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            return {
+                "positions": {},
+                "avg_prices": {},
+                "updated_at": None,
+            }
+
+        return {
+            "positions": row[0] or {},
+            "avg_prices": row[1] or {},
+            "updated_at": row[2].isoformat() if row[2] else None,
+        }
+    except Exception as e:
+        print(f"[PORTFOLIO] Ошибка чтения: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка чтения портфеля: {e}")
+
+
+@app.post("/api/v1/portfolio")
+async def save_portfolio(request: PortfolioRequest):
+    """Сохраняет текущий портфель пользователя."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO current_portfolios (user_id, positions, avg_prices, updated_at)
+            VALUES (1, %s, %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                positions = EXCLUDED.positions,
+                avg_prices = EXCLUDED.avg_prices,
+                updated_at = NOW()
+        """, (
+            json.dumps(request.positions),
+            json.dumps(request.avg_prices),
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        print(f"[PORTFOLIO] Сохранён портфель: {request.positions}")
+        return {
+            "status": "success",
+            "message": "Портфель сохранён",
+            "positions_count": len(request.positions),
+        }
+    except Exception as e:
+        print(f"[PORTFOLIO] Ошибка сохранения: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка сохранения: {e}")
+
+
+# ============================================================================
 # Models
 # ============================================================================
 
@@ -216,6 +296,9 @@ async def save_profile_endpoint(request: SaveProfileRequest):
         "max_asset_weight": request.max_asset_weight,
         "risk_aversion": request.risk_aversion,
         "days_to_forecast": request.days_to_forecast,
+        "cooldown_hours": request.cooldown_hours,
+        "no_trade_threshold": request.no_trade_threshold,
+        "max_turnover": request.max_turnover,
     })
 
     if not success:
@@ -415,7 +498,6 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
     if not request.selected_tickers:
         raise HTTPException(status_code=400, detail="Список тикеров не может быть пустым")
 
-    # Проверка cooldown
     if not request.force:
         is_active, hours_left = check_cooldown(user_id=1)
         if is_active:
@@ -428,7 +510,6 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
                 }
             )
 
-    # Разрешаем параметры
     profile = resolve_profile_or_default(request.profile_name)
 
     if profile:
@@ -448,7 +529,6 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
         resolved_profile_name = None
         print(f"[FASTAPI] Ручной режим: model={resolved_model}")
 
-    # Валидация модели
     if resolved_model not in ModelRegistry.list_names():
         raise HTTPException(
             status_code=400,
@@ -456,7 +536,6 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
                    f"Доступные: {ModelRegistry.list_names()}"
         )
 
-    # Управление подписками
     try:
         redis_client = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
         request_tickers_set = set(request.selected_tickers)
@@ -479,7 +558,6 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
     except Exception as redis_err:
         print(f"Ошибка Redis Pub/Sub: {redis_err}")
 
-    # Логируем оптимизацию (для cooldown)
     log_ui_optimization(
         user_id=1,
         tickers=request.selected_tickers,
@@ -491,7 +569,6 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
     if request.force:
         print(f"[FASTAPI] Принудительный запуск (cooldown обойдён)")
 
-    # Отправляем задачу
     task = celery_app.send_task(
         "tasks.compute_portfolio_optimization",
         kwargs={
@@ -502,6 +579,10 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
             "days_to_forecast": resolved_days,
             "max_asset_weight": resolved_max_weight,
             "profile_name": resolved_profile_name,
+            # Execution-параметры:
+            "cooldown_hours": request.cooldown_hours,
+            "no_trade_threshold": request.no_trade_threshold,
+            "max_turnover": request.max_turnover,
         }
     )
 
