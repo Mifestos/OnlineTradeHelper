@@ -3,6 +3,7 @@ import os
 import sys
 import json
 from typing import List, Optional
+from datetime import datetime
 from redis import asyncio as aioredis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +38,9 @@ from src.settings import REDIS_HOST, REDIS_PORT, DATABASE_URL
 
 current_global_subscriptions = set()
 
+# Cooldown между оптимизациями через UI
+UI_COOLDOWN_HOURS = float(os.getenv("UI_COOLDOWN_HOURS", "24"))
+
 
 # ============================================================================
 # Модели запросов
@@ -50,6 +54,7 @@ class OptimizationRequest(BaseModel):
     risk_aversion: float = 3.0
     days_to_forecast: int = 30
     max_asset_weight: float = 1.0
+    force: bool = False
 
 
 class SaveProfileRequest(BaseModel):
@@ -75,6 +80,66 @@ class ScheduleRequest(BaseModel):
 
 
 # ============================================================================
+# Cooldown helpers
+# ============================================================================
+
+def get_last_ui_optimization(user_id=1):
+    """Возвращает время последней оптимизации через UI."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT triggered_at FROM ui_optimization_log
+            WHERE user_id = %s
+            ORDER BY triggered_at DESC
+            LIMIT 1
+        """, (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"[COOLDOWN] Ошибка чтения: {e}")
+        return None
+
+
+def log_ui_optimization(user_id, tickers, model_name, strategy, is_forced=False):
+    """Логирует оптимизацию через UI."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO ui_optimization_log
+                (user_id, tickers, model_name, optimisation_strategy, is_forced)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (user_id, tickers, model_name, strategy, is_forced))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[COOLDOWN] Ошибка записи: {e}")
+        return False
+
+
+def check_cooldown(user_id=1):
+    """Проверяет, активен ли cooldown. Возвращает (is_active, hours_left)."""
+    last = get_last_ui_optimization(user_id)
+
+    if not last:
+        return False, 0.0
+
+    try:
+        now = datetime.now(last.tzinfo)
+        elapsed = (now - last).total_seconds() / 3600
+        hours_left = max(0, UI_COOLDOWN_HOURS - elapsed)
+        return hours_left > 0, round(hours_left, 2)
+    except Exception as e:
+        print(f"[COOLDOWN] Ошибка расчёта: {e}")
+        return False, 0.0
+
+
+# ============================================================================
 # Lifecycle
 # ============================================================================
 
@@ -91,7 +156,23 @@ async def shutdown_event():
 
 
 # ============================================================================
-# Модели
+# Cooldown endpoint
+# ============================================================================
+
+@app.get("/api/v1/optimize/cooldown")
+async def get_cooldown_status():
+    """Статус cooldown между оптимизациями."""
+    is_active, hours_left = check_cooldown(user_id=1)
+
+    return {
+        "cooldown_active": is_active,
+        "hours_left": hours_left,
+        "cooldown_hours": UI_COOLDOWN_HOURS,
+    }
+
+
+# ============================================================================
+# Models
 # ============================================================================
 
 @app.get("/api/v1/models")
@@ -101,7 +182,7 @@ async def list_models():
 
 
 # ============================================================================
-# Профили
+# Profiles
 # ============================================================================
 
 @app.get("/api/v1/profiles")
@@ -169,7 +250,7 @@ async def delete_profile_endpoint(profile_name: str):
 
 
 # ============================================================================
-# История
+# History
 # ============================================================================
 
 @app.get("/api/v1/history")
@@ -215,7 +296,7 @@ async def get_history(limit: int = 20):
 
 
 # ============================================================================
-# Расписания
+# Schedules
 # ============================================================================
 
 @app.get("/api/v1/schedules")
@@ -263,8 +344,7 @@ async def create_schedule(request: ScheduleRequest):
     if request.model_name not in ModelRegistry.list_names():
         raise HTTPException(
             status_code=400,
-            detail=f"Модель '{request.model_name}' не найдена. "
-                   f"Доступные: {ModelRegistry.list_names()}"
+            detail=f"Модель '{request.model_name}' не найдена."
         )
 
     if not (0 <= request.run_hour <= 23):
@@ -325,7 +405,7 @@ async def delete_schedule(schedule_id: int):
 
 
 # ============================================================================
-# Оптимизация
+# Optimize
 # ============================================================================
 
 @app.post("/api/v1/optimize")
@@ -335,7 +415,20 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
     if not request.selected_tickers:
         raise HTTPException(status_code=400, detail="Список тикеров не может быть пустым")
 
-    # Разрешаем параметры: профиль имеет приоритет над ручными настройками
+    # Проверка cooldown
+    if not request.force:
+        is_active, hours_left = check_cooldown(user_id=1)
+        if is_active:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": f"Cooldown активен. Следующая оптимизация через {hours_left:.1f} ч.",
+                    "cooldown_active": True,
+                    "hours_left": hours_left,
+                }
+            )
+
+    # Разрешаем параметры
     profile = resolve_profile_or_default(request.profile_name)
 
     if profile:
@@ -353,7 +446,7 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
         resolved_days = request.days_to_forecast
         resolved_max_weight = request.max_asset_weight
         resolved_profile_name = None
-        print(f"[FASTAPI] Ручной режим: model={resolved_model}, strategy={resolved_strategy}")
+        print(f"[FASTAPI] Ручной режим: model={resolved_model}")
 
     # Валидация модели
     if resolved_model not in ModelRegistry.list_names():
@@ -363,7 +456,7 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
                    f"Доступные: {ModelRegistry.list_names()}"
         )
 
-    # Управление подписками в Redis Pub/Sub
+    # Управление подписками
     try:
         redis_client = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
         request_tickers_set = set(request.selected_tickers)
@@ -373,20 +466,32 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
                 command = {"action": "subscribe", "ticker": ticker}
                 await redis_client.publish("ticker_subscriptions", json.dumps(command))
                 current_global_subscriptions.add(ticker)
-                print(f"[FASTAPI] Отправлена команда в Redis на подписку: {ticker}")
+                print(f"[FASTAPI] Подписка: {ticker}")
 
         for ticker in list(current_global_subscriptions):
             if ticker not in request_tickers_set:
                 command = {"action": "unsubscribe", "ticker": ticker}
                 await redis_client.publish("ticker_subscriptions", json.dumps(command))
                 current_global_subscriptions.remove(ticker)
-                print(f"[FASTAPI] Отправлена команда в Redis на отмену подписки: {ticker}")
+                print(f"[FASTAPI] Отписка: {ticker}")
 
         await redis_client.close()
     except Exception as redis_err:
-        print(f"Ошибка отправки события в шину Redis Pub/Sub: {redis_err}")
+        print(f"Ошибка Redis Pub/Sub: {redis_err}")
 
-    # Отправляем задачу в Celery
+    # Логируем оптимизацию (для cooldown)
+    log_ui_optimization(
+        user_id=1,
+        tickers=request.selected_tickers,
+        model_name=resolved_model,
+        strategy=resolved_strategy,
+        is_forced=request.force,
+    )
+
+    if request.force:
+        print(f"[FASTAPI] Принудительный запуск (cooldown обойдён)")
+
+    # Отправляем задачу
     task = celery_app.send_task(
         "tasks.compute_portfolio_optimization",
         kwargs={
@@ -405,11 +510,12 @@ async def optimize_portfolio_endpoint(request: OptimizationRequest):
         "message": "Задача оптимизации отправлена.",
         "task_id": task.id,
         "applied_profile": resolved_profile_name,
+        "forced": request.force,
     }
 
 
 # ============================================================================
-# Статус задачи
+# Task status
 # ============================================================================
 
 @app.get("/api/v1/tasks/{task_id}")

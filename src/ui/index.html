@@ -46,6 +46,18 @@
         .results-table th, .results-table td { padding: 10px; border-bottom: 1px solid #e2e8f0; text-align: left; }
         .results-table th { font-weight: 600; color: #444; }
 
+        /* === Cooldown индикатор === */
+        #cooldownIndicator {
+            display: none;
+            margin-top: 12px;
+            padding: 10px 14px;
+            background: #fef3c7;
+            border: 1px solid #fbbf24;
+            border-radius: 6px;
+            font-size: 14px;
+            color: #92400e;
+        }
+
         /* === История === */
         .history-title {
             cursor: pointer; user-select: none;
@@ -125,7 +137,10 @@
         </button>
     </div>
 
-    <button id="calculateBtn" class="run-btn" onclick="startOptimization()">Запустить ИИ-оптимизацию</button>
+    <!-- === Индикатор cooldown === -->
+    <div id="cooldownIndicator"></div>
+
+    <button id="calculateBtn" class="run-btn" onclick="startOptimization(false)">Запустить ИИ-оптимизацию</button>
 
     <div id="loader" class="loader">ИИ-воркер Celery обучается и рассчитывает веса... Подождите...</div>
 
@@ -162,7 +177,7 @@
     </div>
 </div>
 
-<script src="app.js?v=1.0.5"></script>
+<script src="app.js?v=1.1.0"></script>
 
 </body>
 </html>
