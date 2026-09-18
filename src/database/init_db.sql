@@ -77,3 +77,20 @@ CREATE TABLE IF NOT EXISTS schedules (
 
 CREATE INDEX IF NOT EXISTS idx_schedules_active 
     ON schedules (is_active, run_hour, run_minute);
+
+-- ============================================================================
+-- Лог оптимизаций через UI (для cooldown)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS ui_optimization_log (
+    id SERIAL PRIMARY KEY,
+    user_id INT NOT NULL DEFAULT 1,
+    tickers TEXT[] NOT NULL,
+    model_name VARCHAR(50) NOT NULL,
+    optimisation_strategy VARCHAR(50) NOT NULL,
+    is_forced BOOLEAN DEFAULT FALSE,
+    triggered_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ui_opt_log_user_time 
+    ON ui_optimization_log (user_id, triggered_at DESC);
